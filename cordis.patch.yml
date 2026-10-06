@@ -1,0 +1,15 @@
+# Host-plane row for dsh-gandi.
+#
+# It is intentionally a HOST row (no agent realm): `ctx.tools.register()` from a
+# plain context lands in the tools registry's GLOBAL layer, which every agent's
+# scope chain merges — on dsh-tui (agent plane composed process-wide) and on the
+# web surface (agent plane owned by per-session presets) alike. See
+# @deepseek-ai/dsh-tools `ToolRuntime.register()` ("Register globally or in the
+# calling agent scope") and `restrict()` ("known global tools").
+#
+# Installed from a local checkout that is unpacked in place (not a package copy),
+# so `name` is the package directory name resolved by the loader.
+- insert:
+    - id: gandi
+      name: dsh-gandi
+      config: {}

@@ -1,0 +1,28 @@
+{
+  "name": "dsh-gandi",
+  "version": "0.0.1",
+  "description": "Drive Gandi IDE Scratch projects from DeepSeek Harness: read, write, run and observe a live editor over CDP, plus an offline .sb3 toolkit.",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": {
+      "default": "./src/index.mjs"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "skills",
+    "cordis.patch.yml"
+  ],
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

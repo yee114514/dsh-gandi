@@ -832,9 +832,9 @@ export function apply (ctx, rowConfig = {}) {
     name: 'gandi_input',
     mutating: true,
     description: [
-      'Feed keyboard or mouse input to the running project, for testing interactive games.',
-      'Keys are held until released, so press, run, then release. Mouse coordinates are Scratch stage coordinates.',
-      'Events affect the NEXT run, so call this before or between gandi_run calls.'
+      'Set keyboard or mouse state for the running project, for testing interactive games.',
+      'Use this for state that should already hold when a run starts — where the mouse is, or releasing a key left over from an earlier run.',
+      'Do NOT use it to test holding a key down: pressing the green flag stops every thread and clears the held-key cache, so a key set here is discarded. Pass `input` to gandi_run instead, which presses it while the project is actually stepping. Mouse coordinates are Scratch stage coordinates.'
     ].join(' '),
     parameters: {
       type: 'object',

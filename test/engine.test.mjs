@@ -133,14 +133,24 @@ test('gives materialised variable primitives their variableType too', () => {
   assert.deepEqual(variablePrimitive.fields.VARIABLE, { name: 'VARIABLE', value: 'score', id: 'v1', variableType: '' })
 })
 
-test('carries a mutation through unchanged', () => {
+test('normalizes a mutation into the shape the editor reads', () => {
+  // A hand-written mutation with only proccode and argumentids is what makes the editor
+  // throw `Cannot read properties of undefined (reading 'length')` while rendering the
+  // workspace — its reader walks `mutation.children`. The compiler fills in what a
+  // person would not think to write, and leaves the meaningful attributes alone.
   const fragment = compileScripts(`<xml>
     <block type="procedures_call" id="call" x="0" y="0">
       <mutation proccode="jump %n" argumentids="[&quot;a1&quot;]" warp="true"></mutation>
     </block>
   </xml>`)
   const engine = fragmentToEngine(fragment)
-  assert.deepEqual(engine.blocks[0].mutation, { proccode: 'jump %n', argumentids: '["a1"]', warp: 'true' })
+  assert.deepEqual(engine.blocks[0].mutation, {
+    proccode: 'jump %n',
+    argumentids: '["a1"]',
+    warp: 'true',
+    tagName: 'mutation',
+    children: []
+  })
 })
 
 test('refuses to convert a top-level primitive, which has no engine block of its own', () => {

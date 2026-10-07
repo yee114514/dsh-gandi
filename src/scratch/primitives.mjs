@@ -76,6 +76,26 @@ export const PRIMITIVES_BY_CONSTANT = Object.freeze(Object.fromEntries(
  */
 export const isPrimitiveOpcode = (opcode) => Object.hasOwn(PRIMITIVE_OPCODES, opcode)
 
+/**
+ * Primitives that are also DROPDOWN MENUS, which makes them the one place the two
+ * roles overlap.
+ *
+ * Every other menu — a costume, a key, a clone target — is an ordinary `shadow: true`
+ * block in the sb3 format, so it is referenced by id and must be spelled with the
+ * editor's own opcode. The broadcast menu is the exception: because its value is a
+ * broadcast VARIABLE, the format inlines it as `[11, name, id]`, so it is a primitive —
+ * and it is still a menu, which is why a broadcast input has to inline rather than
+ * materialize.
+ *
+ * Getting this wrong is what made a delivery's project unopenable: a shadow block whose
+ * opcode was not a primitive became a block object in the archive, the deserializer read
+ * `opcode.split('_')[0]` as an extension id, and the editor failed with
+ * "Extension not found: broadcast".
+ *
+ * @type {ReadonlySet<string>}
+ */
+export const PRIMITIVE_MENU_OPCODES = new Set(['event_broadcast_menu'])
+
 /** Variable type string used by scratch-vm for scalar variables. */
 export const SCALAR_TYPE = ''
 /** Variable type string used by scratch-vm for lists. */

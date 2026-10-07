@@ -100,7 +100,9 @@ test('round-trips statements, fields with ids, mutations and a top-level primiti
     </block>
   </xml>`)
   assert.match(rendered, /<statement name="SUBSTACK">/)
-  assert.match(rendered, /<mutation proccode="jump %n"/)
+  // The mutation comes back in the editor's own spelling: the compiler normalises what
+  // it was handed, and `children` is an array the editor writes as an empty attribute.
+  assert.match(rendered, /<mutation tagName="mutation" children="" proccode="jump %n"/)
   // The top-level primitive keeps its own map key AND its field id.
   assert.match(rendered, /<block type="data_variable" id="reporterKey" x="120" y="240">/)
   assert.match(rendered, /<field name="VARIABLE" id="v1">score<\/field>/)

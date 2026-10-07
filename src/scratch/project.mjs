@@ -205,9 +205,9 @@ export const collectScript = (blocks, rootId) => {
  * `applyFragment`, which does the same thing against a live runtime.
  *
  * @param {any} project parsed project document (mutated in place)
- * @param {{target?: string, fragment: {blocks: Record<string, any>, topLevelIds: string[], variables?: any[]}, mode?: 'replace'|'append', scope?: 'global'|'local'}} request the edit
+ * @param {{target?: string, fragment: {blocks: Record<string, any>, topLevelIds: string[], variables?: any[]}, mode?: 'replace'|'append'|'replaceScript', script?: number|string, scope?: 'global'|'local'}} request the edit
  * @returns {{target: string, removedBlocks: number, createdBlocks: number, declaredVariables: string[], blocksAfter: number}} what changed
- * @throws {ProjectError} when the target does not exist
+ * @throws {ProjectError} when the target does not exist, or the named script does not
  */
 export const applyFragmentToProject = (project, request) => {
   const target = findProjectTarget(project, request.target)
@@ -216,10 +216,25 @@ export const applyFragmentToProject = (project, request) => {
 
   const blocks = { ...(target.blocks ?? {}) }
   let removedBlocks = 0
-  if (mode === 'replace') {
+  if (mode === 'replace' || mode === 'replaceScript') {
     const roots = Object.keys(blocks).filter((id) => Array.isArray(blocks[id]) || blocks[id]?.topLevel === true)
+    let doomedRoots = roots
+    if (mode === 'replaceScript') {
+      // The offline twin of the live path's single-script swap: a 1-based position in
+      // the script list, or a top-level block id. The two paths have to agree, or
+      // "read the file, edit it, write it back" stops meaning the same as editing live.
+      const wanted = request.script
+      const byIndex = typeof wanted === 'number' ? roots[wanted - 1] : undefined
+      const byId = typeof wanted === 'string' && roots.includes(wanted) ? wanted : undefined
+      const chosen = byIndex ?? byId
+      if (chosen === undefined) {
+        throw new ProjectError(`no such script: ${JSON.stringify(wanted)} — this target has ${roots.length} top-level ` +
+          `script(s); pass a 1-based number, or one of their ids: ${roots.join(', ')}`)
+      }
+      doomedRoots = [chosen]
+    }
     const doomed = new Set()
-    for (const root of roots) for (const id of collectScript(blocks, root)) doomed.add(id)
+    for (const root of doomedRoots) for (const id of collectScript(blocks, root)) doomed.add(id)
     for (const id of doomed) {
       delete blocks[id]
       removedBlocks++

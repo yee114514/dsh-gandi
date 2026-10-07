@@ -186,6 +186,54 @@ test('offline apply with mode append keeps the existing scripts', () => {
   assert.deepEqual(Object.keys(document.targets[1].blocks).sort(), ['added', 'hat', 'set'])
 })
 
+test('offline apply with mode replaceScript swaps exactly one script', () => {
+  // The offline twin of the live single-script swap. They have to agree: "read the
+  // file, edit it, write it back" is only the same operation as editing live if the
+  // two implementations slice the same way.
+  const byIndex = project()
+  const fragment = compileScripts('<xml><block type="event_whenkeypressed" id="swapped" x="0" y="0"><field name="KEY_OPTION">b</field></block></xml>')
+  const result = applyFragmentToProject(byIndex, {
+    target: 'Sprite1',
+    fragment,
+    mode: 'replaceScript',
+    script: 1
+  })
+  assert.equal(result.removedBlocks, 2, 'the first script is the hat plus the block it runs')
+  assert.deepEqual(Object.keys(byIndex.targets[1].blocks).sort(), ['swapped'])
+
+  // ...and by id, which is what a caller who has the XML in hand would use. The script
+  // is the hat AND everything it continues into, so both go.
+  const byId = project()
+  applyFragmentToProject(byId, {
+    target: 'Sprite1',
+    fragment: compileScripts('<xml><block type="event_whenkeypressed" id="swapped2" x="0" y="0"><field name="KEY_OPTION">c</field></block></xml>'),
+    mode: 'replaceScript',
+    script: 'hat'
+  })
+  assert.deepEqual(Object.keys(byId.targets[1].blocks), ['swapped2'])
+})
+
+test('offline replaceScript refuses a script that is not there, and says what is', () => {
+  const document = project()
+  assert.throws(
+    () => applyFragmentToProject(document, {
+      target: 'Sprite1',
+      fragment: { blocks: {}, topLevelIds: [] },
+      mode: 'replaceScript',
+      script: 7
+    }),
+    (error) => {
+      assert.equal(error.name, 'ProjectError')
+      assert.match(error.message, /no such script: 7/)
+      assert.match(error.message, /1 top-level script\(s\)/)
+      assert.match(error.message, /hat/)
+      return true
+    }
+  )
+  // Nothing was removed on the way to the error.
+  assert.deepEqual(Object.keys(document.targets[1].blocks).sort(), ['hat', 'set'])
+})
+
 test('offline apply declares variables on the stage, lists and broadcasts included', () => {
   const document = project()
   const fragment = compileScripts(`<xml>

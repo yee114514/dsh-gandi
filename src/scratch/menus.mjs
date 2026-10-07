@@ -1,0 +1,382 @@
+/**
+ * The XML dialect as the EDITOR spells it: inputs, dropdown shadows and fields.
+ *
+ * GENERATED FILE — edit `tools/gen-block-table.mjs`, not this table.
+ * Regenerate with:
+ *
+ *     node tools/spike-gandi-blocks.mjs      # needs a running editor; writes .spike/blocks.json
+ *     node tools/gen-block-table.mjs         # rewrites this file
+ *
+ * Source: the toolbox flyout of a live Gandi editor, which renders one of every block
+ * together with the default shadows scratch-blocks attaches to its inputs. That flyout
+ * is the only place a dropdown's shadow OPCODE is visible, and the opcode is what the
+ * sb3 deserializer keys on: get it wrong and the block is read as an extension block
+ * ("Extension not found: broadcast") and the whole project stops opening. Two delivery
+ * bugs came from exactly that — an invented `broadcast_msg` shadow, and a clone-object
+ * dropdown written as `looks_costume`, which compiled clean and silently created no
+ * clones at all.
+ *
+ * Coverage is deliberately partial and honest about it: a category whose blocks depend
+ * on project state (lists, most obviously) only renders in the flyout once that state
+ * exists, so an opcode missing here is simply NOT VALIDATED rather than assumed wrong.
+ * Validation must never reject XML for a block this table has never seen.
+ */
+
+/**
+ * Value inputs per opcode, from the editor's own block definitions.
+ * @type {Readonly<Record<string, readonly string[]>>}
+ */
+export const BLOCK_VALUE_INPUTS = Object.freeze({
+  'colour_picker': [],
+  'control_create_clone_of': ['CLONE_OPTION'],
+  'control_create_clone_of_menu': [],
+  'control_delete_this_clone': [],
+  'control_forever': [],
+  'control_if': ['CONDITION'],
+  'control_if_else': ['CONDITION'],
+  'control_repeat': ['TIMES'],
+  'control_repeat_until': ['CONDITION'],
+  'control_start_as_clone': [],
+  'control_stop': [],
+  'control_wait': ['DURATION'],
+  'control_wait_until': ['CONDITION'],
+  'data_changevariableby': ['VALUE'],
+  'data_hidevariable': [],
+  'data_setvariableto': ['VALUE'],
+  'data_showvariable': [],
+  'data_variable': [],
+  'event_broadcast': ['BROADCAST_INPUT'],
+  'event_broadcast_menu': [],
+  'event_broadcastandwait': ['BROADCAST_INPUT'],
+  'event_whenbackdropswitchesto': [],
+  'event_whenbroadcastreceived': [],
+  'event_whenflagclicked': [],
+  'event_whengreaterthan': ['VALUE'],
+  'event_whenkeypressed': [],
+  'event_whenthisspriteclicked': [],
+  'looks_backdropnumbername': [],
+  'looks_backdrops': [],
+  'looks_changeeffectby': ['CHANGE'],
+  'looks_changesizeby': ['CHANGE'],
+  'looks_cleargraphiceffects': [],
+  'looks_costume': [],
+  'looks_costumenumbername': [],
+  'looks_goforwardbackwardlayers': ['NUM'],
+  'looks_gotofrontback': [],
+  'looks_hide': [],
+  'looks_nextbackdrop': [],
+  'looks_nextcostume': [],
+  'looks_say': ['MESSAGE'],
+  'looks_sayforsecs': ['MESSAGE', 'SECS'],
+  'looks_seteffectto': ['VALUE'],
+  'looks_setsizeto': ['SIZE'],
+  'looks_show': [],
+  'looks_size': [],
+  'looks_switchbackdropto': ['BACKDROP'],
+  'looks_switchcostumeto': ['COSTUME'],
+  'looks_think': ['MESSAGE'],
+  'looks_thinkforsecs': ['MESSAGE', 'SECS'],
+  'math_angle': [],
+  'math_integer': [],
+  'math_number': [],
+  'math_positive_number': [],
+  'math_whole_number': [],
+  'motion_changexby': ['DX'],
+  'motion_changeyby': ['DY'],
+  'motion_direction': [],
+  'motion_glidesecstoxy': ['SECS', 'X', 'Y'],
+  'motion_glideto': ['SECS', 'TO'],
+  'motion_glideto_menu': [],
+  'motion_goto': ['TO'],
+  'motion_goto_menu': [],
+  'motion_gotoxy': ['X', 'Y'],
+  'motion_ifonedgebounce': [],
+  'motion_movegrids': ['GRIDS'],
+  'motion_movesteps': ['STEPS'],
+  'motion_pointindirection': ['DIRECTION'],
+  'motion_pointtowards': ['TOWARDS'],
+  'motion_pointtowards_menu': [],
+  'motion_setrotationstyle': [],
+  'motion_setx': ['X'],
+  'motion_sety': ['Y'],
+  'motion_turnleft': ['DEGREES'],
+  'motion_turnright': ['DEGREES'],
+  'motion_xposition': [],
+  'motion_yposition': [],
+  'operator_add': ['NUM1', 'NUM2'],
+  'operator_and': ['OPERAND1', 'OPERAND2'],
+  'operator_contains': ['STRING1', 'STRING2'],
+  'operator_divide': ['NUM1', 'NUM2'],
+  'operator_equals': ['OPERAND1', 'OPERAND2'],
+  'operator_gt': ['OPERAND1', 'OPERAND2'],
+  'operator_join': ['STRING1', 'STRING2'],
+  'operator_length': ['STRING'],
+  'operator_letter_of': ['STRING', 'LETTER'],
+  'operator_lt': ['OPERAND1', 'OPERAND2'],
+  'operator_mathop': ['NUM'],
+  'operator_mod': ['NUM1', 'NUM2'],
+  'operator_multiply': ['NUM1', 'NUM2'],
+  'operator_not': ['OPERAND'],
+  'operator_or': ['OPERAND1', 'OPERAND2'],
+  'operator_random': ['FROM', 'TO'],
+  'operator_round': ['NUM'],
+  'operator_subtract': ['NUM1', 'NUM2'],
+  'sensing_answer': [],
+  'sensing_askandwait': ['QUESTION'],
+  'sensing_coloristouchingcolor': ['COLOR', 'COLOR2'],
+  'sensing_current': [],
+  'sensing_dayssince2000': [],
+  'sensing_distanceto': ['DISTANCETOMENU'],
+  'sensing_distancetomenu': [],
+  'sensing_keyoptions': [],
+  'sensing_keypressed': ['KEY_OPTION'],
+  'sensing_loudness': [],
+  'sensing_mousedown': [],
+  'sensing_mousex': [],
+  'sensing_mousey': [],
+  'sensing_of': ['OBJECT'],
+  'sensing_of_object_menu': [],
+  'sensing_resettimer': [],
+  'sensing_setdragmode': [],
+  'sensing_timer': [],
+  'sensing_touchingcolor': ['COLOR'],
+  'sensing_touchingobject': ['TOUCHINGOBJECTMENU'],
+  'sensing_touchingobjectmenu': [],
+  'sensing_username': [],
+  'sound_changeeffectby': ['VALUE'],
+  'sound_changevolumeby': ['VOLUME'],
+  'sound_cleareffects': [],
+  'sound_play': ['SOUND_MENU'],
+  'sound_playuntildone': ['SOUND_MENU'],
+  'sound_seteffectto': ['VALUE'],
+  'sound_setvolumeto': ['VOLUME'],
+  'sound_sounds_menu': [],
+  'sound_stopallsounds': [],
+  'sound_volume': [],
+  'text': []
+})
+
+/**
+ * Statement (C-block body) inputs per opcode. A `<statement>` belongs on one of these
+ * and a `<value>` does not.
+ * @type {Readonly<Record<string, readonly string[]>>}
+ */
+export const BLOCK_STATEMENT_INPUTS = Object.freeze({
+  'colour_picker': [],
+  'control_create_clone_of': [],
+  'control_create_clone_of_menu': [],
+  'control_delete_this_clone': [],
+  'control_forever': ['SUBSTACK'],
+  'control_if': ['SUBSTACK'],
+  'control_if_else': ['SUBSTACK', 'SUBSTACK2'],
+  'control_repeat': ['SUBSTACK'],
+  'control_repeat_until': ['SUBSTACK'],
+  'control_start_as_clone': [],
+  'control_stop': [],
+  'control_wait': [],
+  'control_wait_until': [],
+  'data_changevariableby': [],
+  'data_hidevariable': [],
+  'data_setvariableto': [],
+  'data_showvariable': [],
+  'data_variable': [],
+  'event_broadcast': [],
+  'event_broadcast_menu': [],
+  'event_broadcastandwait': [],
+  'event_whenbackdropswitchesto': [],
+  'event_whenbroadcastreceived': [],
+  'event_whenflagclicked': [],
+  'event_whengreaterthan': [],
+  'event_whenkeypressed': [],
+  'event_whenthisspriteclicked': [],
+  'looks_backdropnumbername': [],
+  'looks_backdrops': [],
+  'looks_changeeffectby': [],
+  'looks_changesizeby': [],
+  'looks_cleargraphiceffects': [],
+  'looks_costume': [],
+  'looks_costumenumbername': [],
+  'looks_goforwardbackwardlayers': [],
+  'looks_gotofrontback': [],
+  'looks_hide': [],
+  'looks_nextbackdrop': [],
+  'looks_nextcostume': [],
+  'looks_say': [],
+  'looks_sayforsecs': [],
+  'looks_seteffectto': [],
+  'looks_setsizeto': [],
+  'looks_show': [],
+  'looks_size': [],
+  'looks_switchbackdropto': [],
+  'looks_switchcostumeto': [],
+  'looks_think': [],
+  'looks_thinkforsecs': [],
+  'math_angle': [],
+  'math_integer': [],
+  'math_number': [],
+  'math_positive_number': [],
+  'math_whole_number': [],
+  'motion_changexby': [],
+  'motion_changeyby': [],
+  'motion_direction': [],
+  'motion_glidesecstoxy': [],
+  'motion_glideto': [],
+  'motion_glideto_menu': [],
+  'motion_goto': [],
+  'motion_goto_menu': [],
+  'motion_gotoxy': [],
+  'motion_ifonedgebounce': [],
+  'motion_movegrids': [],
+  'motion_movesteps': [],
+  'motion_pointindirection': [],
+  'motion_pointtowards': [],
+  'motion_pointtowards_menu': [],
+  'motion_setrotationstyle': [],
+  'motion_setx': [],
+  'motion_sety': [],
+  'motion_turnleft': [],
+  'motion_turnright': [],
+  'motion_xposition': [],
+  'motion_yposition': [],
+  'operator_add': [],
+  'operator_and': [],
+  'operator_contains': [],
+  'operator_divide': [],
+  'operator_equals': [],
+  'operator_gt': [],
+  'operator_join': [],
+  'operator_length': [],
+  'operator_letter_of': [],
+  'operator_lt': [],
+  'operator_mathop': [],
+  'operator_mod': [],
+  'operator_multiply': [],
+  'operator_not': [],
+  'operator_or': [],
+  'operator_random': [],
+  'operator_round': [],
+  'operator_subtract': [],
+  'sensing_answer': [],
+  'sensing_askandwait': [],
+  'sensing_coloristouchingcolor': [],
+  'sensing_current': [],
+  'sensing_dayssince2000': [],
+  'sensing_distanceto': [],
+  'sensing_distancetomenu': [],
+  'sensing_keyoptions': [],
+  'sensing_keypressed': [],
+  'sensing_loudness': [],
+  'sensing_mousedown': [],
+  'sensing_mousex': [],
+  'sensing_mousey': [],
+  'sensing_of': [],
+  'sensing_of_object_menu': [],
+  'sensing_resettimer': [],
+  'sensing_setdragmode': [],
+  'sensing_timer': [],
+  'sensing_touchingcolor': [],
+  'sensing_touchingobject': [],
+  'sensing_touchingobjectmenu': [],
+  'sensing_username': [],
+  'sound_changeeffectby': [],
+  'sound_changevolumeby': [],
+  'sound_cleareffects': [],
+  'sound_play': [],
+  'sound_playuntildone': [],
+  'sound_seteffectto': [],
+  'sound_setvolumeto': [],
+  'sound_sounds_menu': [],
+  'sound_stopallsounds': [],
+  'sound_volume': [],
+  'text': []
+})
+
+/**
+ * Pure dropdown FIELDS per opcode — the ones written as `<field>`, not `<value><shadow>`.
+ * Confusing the two is silent: the field is simply never read.
+ * @type {Readonly<Record<string, readonly string[]>>}
+ */
+export const BLOCK_FIELDS = Object.freeze({
+  'colour_picker': ['COLOUR'],
+  'control_create_clone_of_menu': ['CLONE_OPTION'],
+  'control_stop': ['STOP_OPTION'],
+  'data_changevariableby': ['VARIABLE'],
+  'data_hidevariable': ['VARIABLE'],
+  'data_setvariableto': ['VARIABLE'],
+  'data_showvariable': ['VARIABLE'],
+  'data_variable': ['VARIABLE'],
+  'event_broadcast_menu': ['BROADCAST_OPTION'],
+  'event_whenbackdropswitchesto': ['BACKDROP'],
+  'event_whenbroadcastreceived': ['BROADCAST_OPTION'],
+  'event_whengreaterthan': ['WHENGREATERTHANMENU'],
+  'event_whenkeypressed': ['KEY_OPTION'],
+  'looks_backdropnumbername': ['NUMBER_NAME'],
+  'looks_backdrops': ['BACKDROP'],
+  'looks_changeeffectby': ['EFFECT'],
+  'looks_costume': ['COSTUME'],
+  'looks_costumenumbername': ['NUMBER_NAME'],
+  'looks_goforwardbackwardlayers': ['FORWARD_BACKWARD'],
+  'looks_gotofrontback': ['FRONT_BACK'],
+  'looks_seteffectto': ['EFFECT'],
+  'math_angle': ['NUM'],
+  'math_integer': ['NUM'],
+  'math_number': ['NUM'],
+  'math_positive_number': ['NUM'],
+  'math_whole_number': ['NUM'],
+  'motion_glideto_menu': ['TO'],
+  'motion_goto_menu': ['TO'],
+  'motion_pointtowards_menu': ['TOWARDS'],
+  'motion_setrotationstyle': ['STYLE'],
+  'operator_mathop': ['OPERATOR'],
+  'sensing_current': ['CURRENTMENU'],
+  'sensing_distancetomenu': ['DISTANCETOMENU'],
+  'sensing_keyoptions': ['KEY_OPTION'],
+  'sensing_of': ['PROPERTY'],
+  'sensing_of_object_menu': ['OBJECT'],
+  'sensing_setdragmode': ['DRAG_MODE'],
+  'sensing_touchingobjectmenu': ['TOUCHINGOBJECTMENU'],
+  'sound_changeeffectby': ['EFFECT'],
+  'sound_seteffectto': ['EFFECT'],
+  'sound_sounds_menu': ['SOUND_MENU'],
+  'text': ['TEXT']
+})
+
+/**
+ * opcode -> input name -> [shadow opcode, field name] for every dropdown input the
+ * editor showed. A shadow of any other type on one of these inputs is the bug class
+ * that produces a project nobody can open.
+ * @type {Readonly<Record<string, Readonly<Record<string, readonly [string, string]>>>>}
+ */
+export const MENU_SHADOWS = Object.freeze({
+  'control_create_clone_of': Object.freeze({ 'CLONE_OPTION': ['control_create_clone_of_menu', 'CLONE_OPTION'] }),
+  'event_broadcast': Object.freeze({ 'BROADCAST_INPUT': ['event_broadcast_menu', 'BROADCAST_OPTION'] }),
+  'event_broadcastandwait': Object.freeze({ 'BROADCAST_INPUT': ['event_broadcast_menu', 'BROADCAST_OPTION'] }),
+  'looks_switchbackdropto': Object.freeze({ 'BACKDROP': ['looks_backdrops', 'BACKDROP'] }),
+  'looks_switchcostumeto': Object.freeze({ 'COSTUME': ['looks_costume', 'COSTUME'] }),
+  'motion_glideto': Object.freeze({ 'TO': ['motion_glideto_menu', 'TO'] }),
+  'motion_goto': Object.freeze({ 'TO': ['motion_goto_menu', 'TO'] }),
+  'motion_pointtowards': Object.freeze({ 'TOWARDS': ['motion_pointtowards_menu', 'TOWARDS'] }),
+  'sensing_distanceto': Object.freeze({ 'DISTANCETOMENU': ['sensing_distancetomenu', 'DISTANCETOMENU'] }),
+  'sensing_keypressed': Object.freeze({ 'KEY_OPTION': ['sensing_keyoptions', 'KEY_OPTION'] }),
+  'sensing_of': Object.freeze({ 'OBJECT': ['sensing_of_object_menu', 'OBJECT'] }),
+  'sensing_touchingobject': Object.freeze({ 'TOUCHINGOBJECTMENU': ['sensing_touchingobjectmenu', 'TOUCHINGOBJECTMENU'] }),
+  'sound_play': Object.freeze({ 'SOUND_MENU': ['sound_sounds_menu', 'SOUND_MENU'] }),
+  'sound_playuntildone': Object.freeze({ 'SOUND_MENU': ['sound_sounds_menu', 'SOUND_MENU'] })
+})
+
+/**
+ * Every opcode that is a dropdown menu block rather than a primitive.
+ *
+ * A menu is a real `shadow: true` block in the sb3 format, so it may only appear where
+ * the block that owns it expects one: `looks_costume` under `CLONE_OPTION` is a block
+ * the runtime will never read, which is how "create clone of" stopped cloning anything.
+ * @type {ReadonlySet<string>}
+ */
+export const MENU_OPCODES = new Set(['control_create_clone_of_menu', 'event_broadcast_menu', 'looks_backdrops', 'looks_costume', 'motion_glideto_menu', 'motion_goto_menu', 'motion_pointtowards_menu', 'sensing_distancetomenu', 'sensing_keyoptions', 'sensing_of_object_menu', 'sensing_touchingobjectmenu', 'sound_sounds_menu'])
+
+/**
+ * Every opcode the dump saw. Used to tell "a core block I know" from "something else,
+ * possibly an extension block I must not judge".
+ * @type {ReadonlySet<string>}
+ */
+export const CORE_OPCODES = new Set(['colour_picker', 'control_create_clone_of', 'control_create_clone_of_menu', 'control_delete_this_clone', 'control_forever', 'control_if', 'control_if_else', 'control_repeat', 'control_repeat_until', 'control_start_as_clone', 'control_stop', 'control_wait', 'control_wait_until', 'data_changevariableby', 'data_hidevariable', 'data_setvariableto', 'data_showvariable', 'data_variable', 'event_broadcast', 'event_broadcast_menu', 'event_broadcastandwait', 'event_whenbackdropswitchesto', 'event_whenbroadcastreceived', 'event_whenflagclicked', 'event_whengreaterthan', 'event_whenkeypressed', 'event_whenthisspriteclicked', 'looks_backdropnumbername', 'looks_backdrops', 'looks_changeeffectby', 'looks_changesizeby', 'looks_cleargraphiceffects', 'looks_costume', 'looks_costumenumbername', 'looks_goforwardbackwardlayers', 'looks_gotofrontback', 'looks_hide', 'looks_nextbackdrop', 'looks_nextcostume', 'looks_say', 'looks_sayforsecs', 'looks_seteffectto', 'looks_setsizeto', 'looks_show', 'looks_size', 'looks_switchbackdropto', 'looks_switchcostumeto', 'looks_think', 'looks_thinkforsecs', 'math_angle', 'math_integer', 'math_number', 'math_positive_number', 'math_whole_number', 'motion_changexby', 'motion_changeyby', 'motion_direction', 'motion_glidesecstoxy', 'motion_glideto', 'motion_glideto_menu', 'motion_goto', 'motion_goto_menu', 'motion_gotoxy', 'motion_ifonedgebounce', 'motion_movegrids', 'motion_movesteps', 'motion_pointindirection', 'motion_pointtowards', 'motion_pointtowards_menu', 'motion_setrotationstyle', 'motion_setx', 'motion_sety', 'motion_turnleft', 'motion_turnright', 'motion_xposition', 'motion_yposition', 'operator_add', 'operator_and', 'operator_contains', 'operator_divide', 'operator_equals', 'operator_gt', 'operator_join', 'operator_length', 'operator_letter_of', 'operator_lt', 'operator_mathop', 'operator_mod', 'operator_multiply', 'operator_not', 'operator_or', 'operator_random', 'operator_round', 'operator_subtract', 'sensing_answer', 'sensing_askandwait', 'sensing_coloristouchingcolor', 'sensing_current', 'sensing_dayssince2000', 'sensing_distanceto', 'sensing_distancetomenu', 'sensing_keyoptions', 'sensing_keypressed', 'sensing_loudness', 'sensing_mousedown', 'sensing_mousex', 'sensing_mousey', 'sensing_of', 'sensing_of_object_menu', 'sensing_resettimer', 'sensing_setdragmode', 'sensing_timer', 'sensing_touchingcolor', 'sensing_touchingobject', 'sensing_touchingobjectmenu', 'sensing_username', 'sound_changeeffectby', 'sound_changevolumeby', 'sound_cleareffects', 'sound_play', 'sound_playuntildone', 'sound_seteffectto', 'sound_setvolumeto', 'sound_sounds_menu', 'sound_stopallsounds', 'sound_volume', 'text'])

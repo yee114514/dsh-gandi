@@ -200,14 +200,59 @@ test('warns about a definition with no proccode', () => {
   assert.match(fragment.warnings[0], /custom block def has no mutation proccode/)
 })
 
-test('warns about a call that cannot resolve its argument ids', () => {
+test('refuses a call whose argument ids cannot be resolved', () => {
+  // Neither in the fragment nor in the target means nothing can supply the ids, and a
+  // call written that way passes no arguments at all — silently. Refuse it here, where
+  // the message can say why.
+  assert.throws(
+    () => compileScripts(`<xml>
+      <block type="procedures_call" id="call" x="0" y="0">
+        <mutation proccode="nowhere %n"></mutation>
+      </block>
+    </xml>`),
+    (error) => {
+      assert.equal(error.name, 'ScriptCompileError')
+      assert.match(error.message, /call to "nowhere %n": no definition of it is in this fragment or in the target/)
+      return true
+    }
+  )
+})
+
+test('a parameterless call with no local definition is accepted', () => {
+  // `argumentids="[]"` and a proccode with no placeholders agree: there is nothing to
+  // resolve, so the call is usable against a definition that already exists.
   const fragment = compileScripts(`<xml>
     <block type="procedures_call" id="call" x="0" y="0">
-      <mutation proccode="nowhere %n"></mutation>
+      <mutation proccode="reset"></mutation>
     </block>
   </xml>`)
-  assert.equal(fragment.warnings.length, 1)
-  assert.match(fragment.warnings[0], /call to "nowhere %n" has no matching definition/)
+  assert.deepEqual(fragment.warnings, [])
+  // Scratch always writes `argumentids` on a call, and an empty JSON array is what a
+  // block with no parameters declares.
+  assert.deepEqual(fragment.blocks.call.mutation, {
+    tagName: 'mutation',
+    children: [],
+    proccode: 'reset',
+    argumentids: '[]',
+    warp: 'false'
+  })
+})
+
+test('resolves a call against a custom block the target already has', () => {
+  // The append case, and the reason `procedures` exists: the definition is not in this
+  // fragment, so the argument ids have to come from the project being appended to.
+  const fragment = compileScripts(`<xml>
+    <block type="procedures_call" id="call" x="0" y="0">
+      <mutation proccode="jump %n"></mutation>
+      <value name="height"><shadow type="math_number"><field name="NUM">30</field></shadow></value>
+    </block>
+  </xml>`, {
+    procedures: [{ proccode: 'jump %n', argumentids: '["existingId"]', argumentnames: '["height"]', warp: 'false' }]
+  })
+  assert.deepEqual(fragment.warnings, [])
+  assert.equal(fragment.blocks.call.mutation.argumentids, '["existingId"]')
+  // ...and the input was renamed from the argument NAME to the id the target uses.
+  assert.ok(fragment.blocks.call.inputs.existingId, JSON.stringify(fragment.blocks.call.inputs))
 })
 
 test('a call with ids but no definition in the fragment is left alone', () => {

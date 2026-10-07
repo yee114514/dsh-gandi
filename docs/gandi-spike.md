@@ -298,6 +298,76 @@ postIOData(...) → greenFlag → 10 帧                                ⇒ x = 
 字符串带引号——`n="7"` 和 `n=7` 是**不同**的项目状态，测试也该能区分。
 （e2e 里那条断言因此改成找 `="7"`，并且**故意**保留引号。）
 
+## 16. 步进率：编辑器自己有循环，`gandi_run` 必须把它按停
+
+**结论**：Gandi 的 `runtime` 有一个自己的步进循环，`runtime.start()` → `frameLoop.start()`，
+而 `FrameLoop` 在这个版本里是 **`setInterval(this.stepCallback, 1000 / framerate)`**
+（`framerate = 30`），`stepCallback` 调的就是 `runtime._step`。也就是说：
+
+- 用户在编辑器里点过绿旗（GUI 的处理器会 `vm.start()`）之后，**编辑器自己每秒也推进 30 帧**；
+- 插件 `runSteps` 又按真实时钟推进 30 帧/秒；
+- 于是项目在**前台窗口**下一秒钟走约 60 帧，在**后台窗口**下只走约 30 帧
+  （后台页面的 `setInterval` 被节流，实测几乎不触发）。
+
+一次真实交付量到自己的帧计数器是 `gandi_run` 报的帧数的 **1.85~2.06 倍**，
+于是得出"实际是 60 fps"，把整套物理常数按双倍速调了一遍。
+
+**修法**：`runSteps` 在按绿旗之前 `frameLoop.stop()`（原来是 `_steppingInterval` 就
+`clearInterval`），跑完用 `runtime.start()` 还原——**只在原本就在跑的时候还原**。
+
+实测（`node tools/e2e.mjs`，循环体带 `wait 0 seconds` 的计数器）：
+
+```
+[PASS] one second of project time is ~30 frames, not ~60 — counter after 1s: 29
+```
+
+**另一条容易搞混的事实**：`永远 { 改变变量 1 }`（循环体里没有任何等待）**不是帧计数器**。
+scratch-vm 给一个线程每帧 `75% × currentStepTime` 的**工作时间预算**，
+非等待类积木会一直执行到用完为止——同一个探针测到一秒 **663162** 次。
+要数帧就在循环体里放一个 `wait 0 seconds`（它恰好 `util.yield()` 一次）。
+
+## 17. 下拉菜单的 shadow 只能从编辑器里读出来
+
+`<shadow type="…">` 里的 opcode **不是一个可以推理出来的东西**：菜单（造型、按键、克隆对象…）
+在 sb3 里是**真实的 `shadow: true` 积木**，而数值/文本是十种会被序列化器**内联**的 primitive。
+把菜单的 opcode 写错有两种后果，都很贵：
+
+- 写成另一个菜单：积木照样能建、能存、编辑器里也长得对，只是**读不到值**——
+  `create clone of` 读不到 `CLONE_OPTION`，一个克隆体都不产生，**全程没有任何报错**；
+- 写成 `broadcast_msg`（那是**变量声明的 type**）：影子块进了 `blocks` 表，
+  反序列化器按 `opcode.split('_')[0]` 当成扩展 id 去加载 → `Extension not found: broadcast`，
+  **项目直接打不开**。
+
+**证据来源**：编辑器的工具箱 flyout 会渲染每个积木和它默认挂的 shadow，
+`tools/spike-gandi-blocks.mjs` 把它整个 dump 出来（`Blockly.getMainWorkspace().getFlyout()
+.getWorkspace().getAllBlocks()`，读 `inputList[].connection.targetBlock()`），
+`tools/gen-block-table.mjs` 再把它生成 `src/scratch/menus.mjs`。生成出来的对照表里
+`event_broadcast.BROADCAST_INPUT → event_broadcast_menu`——**不是** `broadcast_msg`。
+
+注意：`Blockly.Blocks` 在 Gandi 里**不存在**（`window.Blockly` 只有
+`Events/Utils/Xml/Mutator/ContextMenu/getMainWorkspace/Msg/ScratchMsgs` 八项，没有
+`ScratchBlocks`，`getAllBlocks` 在主工作区上是空的），所以"遍历块定义"这条路走不通，
+只能读 flyout。另外 flyout 的内容依赖工程状态：没有列表时"变量"分类里就没有列表积木，
+所以生成的表是**部分**的——查不到的东西一律不校验，绝不因为"没见过"就拒绝。
+
+## 18. 造型/声音的增删改：方法在 Target 上，不在 VM 上
+
+`vm.renameCostume(index, name)` / `vm.deleteCostume(index)` **只作用于当前选中的角色**
+（内部是 `this.editingTarget.…`），所以在多角色工程里用它们是错的。
+真正能用的是 Target 上的：
+
+```
+target.renameCostume(index, name, fireEvent = true)   // 名字会过 unusedName，可能被去重改名
+target.deleteCostume(index, fireEvent?)               // 越界返回 null；只剩一张时也返回 null
+target.renameSound(index, name, fireEvent = true)     // 顺带改掉脚本里引用它名字的 sound_play
+target.deleteSound(index)                             // 不会改脚本引用
+target.getCostumeIndexByName(name)
+```
+
+两个细节值得记住：`deleteCostume` **不允许删掉最后一张**（返回 `null`，不是抛错），
+而 `renameCostume` 的返回值是 `undefined`——新名字要**从 `getCostumes()[index].name` 读回来**，
+因为它可能被加后缀。
+
 ## 复现方式
 
 ```powershell
@@ -313,6 +383,12 @@ node tools/spike-gandi-loop.mjs           # 写积木 → 工作区 → 跑 → 
 node tools/spike-gandi-keyboard.mjs       # 按键帽子的正确顺序
 node tools/spike-gandi-comments-sound-shot.mjs
 node tools/spike-gandi-renderer.mjs       # 渲染器与截图路径
+node tools/spike-gandi-blocks.mjs         # 工具箱 flyout：每个积木的输入与下拉 shadow（第 17 条）
+node tools/spike-gandi-sprite-api.mjs     # 造型/声音的增删改入口（第 18 条）
+node tools/spike-gandi-step-rate.mjs [--front]   # 谁在推进运行时、每秒推进几次（第 16 条）
+
+# 2b. 从 flyout dump 重新生成编译器的方言表
+node tools/gen-block-table.mjs            # .spike/blocks.json -> src/scratch/menus.mjs
 
 # 3. 验收（会快照并还原它所在的那个页签）
 node tools/e2e.mjs
@@ -327,5 +403,10 @@ node tools/e2e.mjs
 - 截图从"注册回调然后等"改成"同一帧里 redraw + snapshot + draw"。
 - `gandi_run` 多了 `input`，按键在跑的过程中投递。
 - 空白项目带背景（第 11 条）。
+- `runSteps` 在跑之前**按停编辑器自己的步进循环**，跑完还原（第 16 条）。
+- 编译器多了方言校验：下拉 shadow 必须是该输入的那个 opcode，非下拉输入只接受 primitive，
+  `<mutation>` 一律补齐编辑器要读的字段（`tagName`/`children`/`warp`）。
+  表是生成的（第 17 条），校验只对表里有的积木生效。
+- 跨片段的自定义积木调用按 `proccode` 去目标角色已有定义里取 argument id。
 - `tools/` 下 TurboWarp 时代的探针没有删：它们仍然是"上游怎么工作"的证据，
   只是连着 `tw-editor://` 跑不通了。

@@ -22,22 +22,28 @@
 
 | 位置 | 是什么 |
 | --- | --- |
-| `src/index.mjs` | 插件入口：17 个工具的注册、参数校验、输出渲染。改工具面只改这里 |
+| `src/index.mjs` | 插件入口：20 个工具的注册、参数校验、输出渲染。改工具面只改这里 |
 | `src/plugin/service.mjs` | 进程级单例 `BridgeService`：互斥链、会话租约、attach 判定、错误话术 |
 | `src/bridge/cdp.mjs` | CDP 客户端（零依赖）。`evaluate` / `callFunction`，错误会带**页面侧调用栈** |
 | `src/bridge/app.mjs` | 找与记住 `Gandi.exe`、探测 target、拉起、向 shell 要一个编辑器页签、等编辑器就绪 |
 | `src/bridge/gandi-vm.mjs` | 页面侧**找 VM** 的解析器与引导片段（Gandi 没有 `window.vm`，见下） |
 | `src/bridge/ops.mjs` | **所有页面侧操作都在这里**，页面源码以模板字符串内嵌，每条都以 `${vmBootstrapSource()}` 开头 |
 | `src/scratch/xml-parse.mjs` | 够用的 XML 解析器（含 `escapeXml`） |
-| `src/scratch/xml.mjs` | 编译器、反编译器、自定义积木展开、注释收集、孤儿清理 |
+| `src/scratch/xml.mjs` | 编译器、反编译器、自定义积木展开、注释收集、孤儿清理、**方言校验**（下拉 shadow / 输入名 / mutation 规范化） |
+| `src/scratch/menus.mjs` | **生成文件**：编辑器自己的积木输入与下拉 shadow 表。改 `tools/gen-block-table.mjs`，别手改 |
 | `src/scratch/primitives.mjs` | 原语常量表，**改动前先核对上游** |
 | `src/scratch/engine.mjs` | 线形式 ↔ 引擎形式，**双向**都要维护 |
 | `src/scratch/sb3.mjs` | `.sb3` 归档读写、`blankProject` / `starterProject` / `buildSprite` |
 | `src/scratch/project.mjs` | 离线项目层：读角色、拼片段、写回文档 |
+| `src/scratch/verify.mjs` | 加载前自检：opcode 会不会被当成扩展、mutation 少没少字段、下拉 shadow 对不对、引用悬没悬空、素材在不在 |
+| `src/scratch/merge.mjs` | 把另一个工程的角色（含私有变量/造型/音效与素材字节）并进来 |
 | `src/scratch/zip.mjs` / `wav.mjs` / `svg.mjs` / `keys.mjs` | 手写的小工具 |
-| `test/` | 163 项单元测试，全部离线可跑 |
-| `tools/e2e.mjs` | 验收测试：走真实工具面驱动真编辑器 |
+| `test/` | 213 项单元测试，全部离线可跑 |
+| `tools/e2e.mjs` | 验收测试：走真实工具面驱动真编辑器（97 项断言） |
 | `tools/cleanup-editor.mjs` | 把编辑器恢复到确定的基准（**会先备份**） |
+| `tools/spike-gandi-blocks.mjs` | 把编辑器工具箱的 flyout dump 成 `.spike/blocks.json`（积木输入 + 下拉 shadow 的唯一可信来源） |
+| `tools/gen-block-table.mjs` | 用上面的 dump 重新生成 `src/scratch/menus.mjs` |
+| `tools/spike-gandi-step-rate.mjs` | 谁在推进运行时、每秒几次（`--front` 测前台） |
 | `tools/spike*.mjs` | 探针（`.spike/` 下还有一批 Gandi 移植期的，编号见下）。不是历史垃圾，是"上游到底怎么工作"的可执行证据。注意 `tools/` 里几个是 TurboWarp 时代的，连着 `tw-editor://` 目标跑不通，别把它们当 Gandi 的基线 |
 | `docs/gandi-spike.md` | **Gandi 侧**的实测结论（挂接模型、找 VM、积木/注释/声音/截图的真实调用方式）。新发现要追加 |
 | `docs/spike.md` | TurboWarp 时代的踩坑记录。其中与编辑器无关的部分（离线 `.sb3`、编译器、积木表示）仍然有效；带 `tw-editor://` 的复现步骤已经过时。**新的 Gandi 结论写进 `docs/gandi-spike.md`** |
@@ -53,6 +59,9 @@ node tools/cleanup-editor.mjs --reset        # 把编辑器重置成确定的基
 node tools/e2e.mjs                           # 验收测试（会快照并还原用户项目）
 node tools/e2e.mjs --keep                    # 保留改动，自己看
 node tools/spike-procedures.mjs              # 例：问编辑器"自定义积木的 XML 长什么样"
+node tools/spike-gandi-blocks.mjs            # 问编辑器"每个积木的输入和下拉 shadow 叫什么"（要编辑器）
+node tools/gen-block-table.mjs               # 用上面的 dump 重新生成 src/scratch/menus.mjs（离线）
+node tools/spike-gandi-step-rate.mjs         # 问编辑器"谁在推进运行时、每秒几次"（要编辑器）
 ```
 
 装到 profile 里：
@@ -94,8 +103,12 @@ dsh --profile <p> --dump-config | Select-String gandi    # 确认真的装上了
 
 5. **工具面清单是断言过的。** `test/plugin.test.mjs` 比对排序后的工具名数组与
    `concurrencySafe` 划分。加/删工具必须同步改那里。
-   只读工具（status/inspect/observe/screenshot/save）`concurrencySafe: true`；
+   只读工具（status/inspect/observe/screenshot/save/lease/verify-offline）`concurrencySafe: true`；
    其余 `mutating: true`，走租约与串行化。
+   **每个 mutating 工具都自动获得 `force`**（`registerTool` 统一注入），
+   因为报错话术里承诺过它，而 `additionalProperties: false` 会把没声明的参数丢掉——
+   曾经那句"pass force: true to take over"是**永远做不到**的。`test/plugin.test.mjs` 里有一条
+   断言守着这个不变量：凡是 mutating 工具就必须有 `force`，只读工具就必须没有。
 
 6. **页面源码是模板字符串。** 在那里面写注释**不能出现反引号**——一个反引号提前闭合字面量，
    报错是几十行外的 `missing ) after argument list`。这个坑踩过三次，
@@ -124,6 +137,11 @@ dsh --profile <p> --dump-config | Select-String gandi    # 确认真的装上了
 | `vm.loadProject(projectJson)` | 项目带资产时**永不 settle**（造型加载器等一个谁也注册不了的资产），表现是 120 秒超时且项目**已部分应用**。装东西进编辑器一律走**归档字节** |
 | 舞台 | 名字是 `Stage`，不是 `stage`；`target:"stage"` 是插件的大小写不敏感约定。给舞台加背景走 `vm.addBackdrop`，不是 `addCustom` |
 | 运行节奏 | `runtime.currentStepTime` 是固定帧长（1000/30），计时块读的是**真实时钟**。必须按真实间隔推进，否则 `wait 1 seconds` 要上千步。被节流的是页面（后台窗口约 1 秒一次），所以节奏由 Node 侧控制 |
+| **编辑器自己也有一套推进循环** | `runtime.start()` → `frameLoop.start()`，`FrameLoop` 是 `setInterval(stepCallback, 1000/framerate)`（framerate 30），**`stepCallback` 调的就是 `runtime._step`**。用户在编辑器里点过一次绿旗就永久armed。桥接不按停它的话，项目在前台窗口一秒走 ~60 帧、后台走 ~30 帧——这就是那次"实测 60 fps"的全部真相。`runSteps` 现在跑前 `frameLoop.stop()`、跑后用 `runtime.start()` 还原（只在原本 running 时）。见 `docs/gandi-spike.md` 第 16 条 |
+| 一帧不止一个循环体 | 线程每帧有 `75% × currentStepTime` 的**工作时间预算**，非等待类积木会一直执行到用完。`永远 { 改变变量 1 }` 一秒自增几十万次（实测 663162），**不是帧计数器**。数帧要在循环体里放 `wait 0 seconds` |
+| 下拉菜单的 shadow opcode | **必须从编辑器读**：菜单在 sb3 里是真实的 `shadow: true` 积木，opcode 写错时——写成别的菜单 = 静默读不到值（`create clone of` 一个克隆体都不产生），写成 `broadcast_msg` = 项目打不开（`Extension not found: broadcast`）。表在 `src/scratch/menus.mjs`（生成）。广播是**唯一**既是 primitive 又是菜单的那个（常数 11），所以它必须内联 |
+| `procedures_call` 的 mutation | scratch-blocks 渲染工作区时会读 `mutation.children.length`，只有 `{proccode, argumentids}` 的残缺 mutation 会让编辑器抛 `Cannot read properties of undefined (reading 'length')` 且项目打不开。编译器一律补齐 `tagName`/`children`/`warp` |
+| 造型/声音的增删改 | 方法在 **Target** 上，不在 VM 上：`vm.renameCostume(index, name)` / `vm.deleteCostume(index)` 只作用于**当前选中的角色**。用 `target.renameCostume(index, name, fireEvent)`（名字会被 `unusedName` 去重，要**读回来**）、`target.deleteCostume(index)`（越界或只剩一张时返回 `null`，不抛错）、`target.renameSound`/`deleteSound`。rename 会改脚本里的引用，delete 不会 |
 | 截图 | 快照回调只在 `draw()` 内部发出，而 `draw()` 在渲染器不脏时直接返回。必须显式 `requestRedraw()` + `dirty = true` + `draw()`。另外**回调挂在 renderer 上**（`renderer.requestSnapshot`），`runtime` 上那个是 `requestRedraw` |
 | 找 VM | Gandi **没有 `window.vm`**（加载完扩展后还会把 `global.Scratch.vm` 显式置空）。VM 要从 Redux 的 `scratchGui.vm` 或某个拿到 `vm` prop 的组件上取，`src/bridge/gandi-vm.mjs` 负责这件事 |
 | 工作区 | Gandi 暴露的是 `window.Blockly`（不是 `ScratchBlocks`），主工作区用 `Blockly.getMainWorkspace()` |
@@ -186,6 +204,14 @@ dsh --profile <p> --dump-config | Select-String gandi    # 确认真的装上了
   更不改 Gandi 的界面。本项目是从外面通过 CDP 驱动编辑器。
   顺带记一条：Gandi 的**在线**编辑器确实是靠 `window.Scratch.plugins.register` 注入插件的，
   但那条路要用户自己点开设置填 URL，不是插件该走的路。
+- **`gandi_merge` 不并舞台的背景**：它按角色名并角色的脚本、私有变量/列表、造型/音效与素材；
+  舞台的 `costumes`/`sounds` 保持目标工程的样子（舞台归主控，这是那个范式的约定）。
+  全局变量/列表/广播按 id **取并集**，不覆盖。
+- **`gandi_verify {live: true}` 会真的加载那个文件**，所以一个坏项目有可能把编辑器窗口搞坏
+  （那正是它要提前发现的事）。它跑前会导出快照、跑完还原，但这条路上没有魔法：
+  编辑器崩了就崩了，重新 `gandi_launch` 即可。
+- **`resetVariables` 不是"恢复工程初值"**：它把标量置 0、列表清空（广播消息不动）。
+  工程里声明的初值在第一次写入之后运行时就不再知道了。
 - **未在 DSH 的 `desktop` surface 上验证**（只验证了 `dsh-tui` 与 `web`）。
 - **新建角色**没有走 `vm.addSprite`（它要求资产已在 storage 里，公开 API 不接受资产对象），
   而是**复制 → 清空 → 换造型**。代价是必须有一个源角色可复制——这就是

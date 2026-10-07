@@ -26,7 +26,20 @@
 import { randomBytes } from 'node:crypto'
 
 import { parseXml, childElement, childElements, escapeXml } from './xml-parse.mjs'
-import { PRIMITIVE_OPCODES, PRIMITIVES_BY_CONSTANT, isPrimitiveOpcode } from './primitives.mjs'
+import {
+  BLOCK_FIELDS,
+  BLOCK_STATEMENT_INPUTS,
+  BLOCK_VALUE_INPUTS,
+  CORE_OPCODES,
+  MENU_OPCODES,
+  MENU_SHADOWS
+} from './menus.mjs'
+import {
+  PRIMITIVE_MENU_OPCODES,
+  PRIMITIVE_OPCODES,
+  PRIMITIVES_BY_CONSTANT,
+  isPrimitiveOpcode
+} from './primitives.mjs'
 
 /** Raised for XML that is well-formed but not a usable script fragment. */
 export class ScriptCompileError extends Error {
@@ -54,16 +67,172 @@ export const randomBlockId = () => {
  * @property {Record<string, any>} blocks block id -> sb3 block object (or inlined primitive array for a top-level primitive)
  * @property {string[]} topLevelIds ids of the fragment's top-level blocks, in document order
  * @property {{id: string, name: string, type: string}[]} variables variable/list declarations found in `<variables>`
+ * @property {any[]} comments comment records, each naming the block it hangs off
  * @property {string[]} warnings non-fatal problems; the caller decides whether to apply anyway
  */
+
+/**
+ * Where each dropdown shadow is allowed to appear: `shadow opcode -> [{opcode, input}]`.
+ *
+ * Built from the generated dialect table so the compiler can answer both directions of
+ * the same question — "this input needs a different shadow" and "this shadow belongs
+ * somewhere else" — which is what makes the error message actionable.
+ *
+ * @type {ReadonlyMap<string, {opcode: string, input: string}[]>}
+ */
+const MENU_HOMES = (() => {
+  const homes = new Map()
+  for (const [opcode, inputs] of Object.entries(MENU_SHADOWS)) {
+    for (const input of Object.keys(inputs)) {
+      const shadow = inputs[input][0]
+      const list = homes.get(shadow) ?? []
+      list.push({ opcode, input })
+      homes.set(shadow, list)
+    }
+  }
+  return homes
+})()
+
+/**
+ * Readable list of the block.input places a dropdown shadow belongs under.
+ * @param {string} shadowOpcode the menu's opcode
+ * @returns {string} e.g. `control_create_clone_of.CLONE_OPTION`
+ */
+const menuHomes = (shadowOpcode) =>
+  (MENU_HOMES.get(shadowOpcode) ?? []).map((home) => `${home.opcode}.${home.input}`).join(' or ')
+
+/**
+ * Validate one input's shadow against the block's OWN definition, and report what the
+ * editor would do with it.
+ *
+ * This is the check that a delivery was missing. Scratch's XML has two kinds of
+ * dropdown, and they are spelled completely differently:
+ *
+ *   - a menu (`looks_costume`, `control_create_clone_of_menu`, …) is a real
+ *     `shadow: true` BLOCK, so its opcode has to be the editor's own; a wrong one
+ *     silently never resolves (a clone block whose menu says `looks_costume` reads no
+ *     clone option, so nothing is ever cloned — no error anywhere);
+ *   - everything else is one of the ten primitives the sb3 serializer INLINES, so a
+ *     non-primitive shadow there becomes a block object in the archive, and an opcode
+ *     the runtime does not recognise is treated as an extension id: the editor fails
+ *     with "Extension not found: broadcast" and the project stops opening.
+ *
+ * Only blocks the generated table knows are judged. An extension block's inputs are its
+ * own business, and rejecting them would break working projects.
+ *
+ * @param {{parentOpcode: string, parentId: string, inputName: string, isStatement: boolean, shadow?: any, errors: string[], warnings: string[]}} request the input to check
+ */
+const checkInputShape = (request) => {
+  const { parentOpcode, parentId, inputName, isStatement, shadow, errors, warnings } = request
+  if (!CORE_OPCODES.has(parentOpcode)) return
+
+  const valueInputs = BLOCK_VALUE_INPUTS[parentOpcode] ?? []
+  const statementInputs = BLOCK_STATEMENT_INPUTS[parentOpcode] ?? []
+  const expected = MENU_SHADOWS[parentOpcode]?.[inputName]
+
+  if (!valueInputs.includes(inputName) && !statementInputs.includes(inputName)) {
+    warnings.push(`block ${parentId} (${parentOpcode}) has no input named "${inputName}"; it would be written to the project and never read`)
+    return
+  }
+  if (isStatement && !statementInputs.includes(inputName)) {
+    warnings.push(`block ${parentId} (${parentOpcode}): <statement name="${inputName}"> — that input holds a value; use <value>`)
+  }
+  if (!isStatement && statementInputs.includes(inputName)) {
+    warnings.push(`block ${parentId} (${parentOpcode}): <value name="${inputName}"> — that input holds a script; use <statement>`)
+  }
+
+  const shadowOpcode = shadow?.attributes?.type
+  if (typeof shadowOpcode !== 'string' || shadowOpcode.length === 0) return
+
+  if (expected !== undefined) {
+    const [wantOpcode, wantField] = expected
+    if (shadowOpcode !== wantOpcode) {
+      // Two spellings are common enough to name explicitly, because both come from
+      // something else in this very dialect.
+      const hint = shadowOpcode === 'broadcast_msg'
+        ? ' `broadcast_msg` is the type of a broadcast VARIABLE in <variables>, not a shadow type.'
+        : (MENU_OPCODES.has(shadowOpcode) ? ` ${shadowOpcode} belongs under ${menuHomes(shadowOpcode)}.` : '')
+      errors.push(`block ${parentId} (${parentOpcode}): input ${inputName} takes the dropdown <shadow type="${wantOpcode}">, not type="${shadowOpcode}".${hint}`)
+      return
+    }
+    const fieldNames = childElements(shadow, 'field')
+      .map((field) => field.attributes.name)
+      .filter((name) => typeof name === 'string' && name.length > 0)
+    if (!fieldNames.includes(wantField)) {
+      errors.push(`block ${parentId} (${parentOpcode}): the ${wantOpcode} shadow needs <field name="${wantField}">; it has ` +
+        (fieldNames.length === 0 ? 'no fields at all' : fieldNames.map((name) => `"${name}"`).join(', ')))
+    }
+    for (const name of fieldNames) {
+      if (name !== wantField) {
+        warnings.push(`block ${parentId} (${parentOpcode}): the ${wantOpcode} shadow carries <field name="${name}">, which nothing reads`)
+      }
+    }
+    return
+  }
+
+  if (isPrimitiveOpcode(shadowOpcode)) return
+  if (MENU_OPCODES.has(shadowOpcode)) {
+    errors.push(`block ${parentId} (${parentOpcode}): input ${inputName} does not take a dropdown, but its shadow is the menu ${shadowOpcode}` +
+      (menuHomes(shadowOpcode) === '' ? '' : `, which belongs under ${menuHomes(shadowOpcode)}`))
+    return
+  }
+  errors.push(`block ${parentId} (${parentOpcode}): <shadow type="${shadowOpcode}"> under ${inputName} is neither a primitive ` +
+    `(${Object.keys(PRIMITIVE_OPCODES).join(', ')}) nor a dropdown this editor knows. It would be written as a block the runtime ` +
+    'cannot look up, which is what makes a project refuse to open.')
+}
+
+/**
+ * Normalise a `<mutation>` the way the editor's own XML reader expects to find it.
+ *
+ * A mutation attribute map is passed straight through to the archive, and the two
+ * hand-written shapes that turn up in practice are incomplete in ways the editor does
+ * not tolerate: `scratch-blocks` reads `mutation.children.length` while rendering the
+ * workspace, so a call carrying only `proccode` and `argumentids` (which is what the
+ * authoring guide used to tell people to write for a cross-fragment call) crashes the
+ * editor with `Cannot read properties of undefined (reading 'length')` and the project
+ * never opens. `tagName`, `children` and `warp` are therefore always filled in.
+ *
+ * @param {string} opcode the block the mutation belongs to
+ * @param {Record<string, unknown>} attributes the raw attribute map
+ * @param {string[]} errors collector for shapes that cannot be repaired
+ * @returns {Record<string, unknown>} the normalised mutation
+ */
+const normalizeMutation = (opcode, attributes, errors) => {
+  const mutation = { ...attributes }
+  if (mutation.tagName === undefined) mutation.tagName = 'mutation'
+  // `children` is an ARRAY in the runtime and an attribute in XML, where an empty one
+  // is written as `children=""`. Normalising to the array is what makes the round trip
+  // through this compiler — and through the editor's own workspace renderer — stable.
+  if (!Array.isArray(mutation.children)) mutation.children = []
+  if (mutation.warp !== undefined) mutation.warp = mutation.warp === true || mutation.warp === 'true' ? 'true' : 'false'
+
+  if (opcode === 'procedures_call' || opcode === 'procedures_prototype' || opcode === 'procedures_definition') {
+    if (typeof mutation.proccode !== 'string' || mutation.proccode.length === 0) {
+      errors.push(`${opcode} block: <mutation> has no proccode, so the editor cannot tell which custom block it is; ` +
+        'write proccode="name %n" as the block was defined')
+    }
+    if (mutation.warp === undefined) mutation.warp = 'false'
+    // A call addresses its arguments by id. `[]` is valid for a block with no
+    // parameters and is what makes the attribute JSON rather than a bare string.
+    if (opcode === 'procedures_call' && mutation.argumentids !== undefined && !Array.isArray(mutation.argumentids)) {
+      const parsed = parseArray(mutation.argumentids)
+      if (parsed === null) {
+        errors.push('procedures_call block: argumentids must be a JSON array of argument ids, e.g. argumentids="[\\"arg1\\"]"')
+      } else {
+        mutation.argumentids = JSON.stringify(parsed)
+      }
+    }
+  }
+  return mutation
+}
 
 /**
  * Compile a scratch-blocks XML fragment into sb3 blocks.
  *
  * @param {string} source XML text: an `<xml>` root, or a bare `<block>`/`<shadow>`
- * @param {{newId?: () => string}} [options] injectable id generator (tests use a counter)
+ * @param {{newId?: () => string, procedures?: Iterable<{proccode: string, argumentids?: any, argumentnames?: any, warp?: any}>}} [options] injectable id generator (tests use a counter) and the custom blocks the target already has
  * @returns {CompiledFragment} the compiled fragment
- * @throws {ScriptCompileError} when the document is not a usable script fragment
+ * @throws {ScriptCompileError} when the document is not a usable script fragment, or when the XML would produce a project the editor cannot open
  */
 export function compileScripts (source, options = {}) {
   const newId = options.newId ?? randomBlockId
@@ -86,6 +255,13 @@ export function compileScripts (source, options = {}) {
   const topLevelIds = []
   /** @type {string[]} */
   const warnings = []
+  /**
+   * Problems that make the XML produce a project the editor cannot open. They are
+   * collected rather than thrown one at a time so a caller sees every mistake at once,
+   * and they are raised together at the end.
+   * @type {string[]}
+   */
+  const errors = []
   /** @type {{id: string, name: string, type: string}[]} */
   const variables = []
   /** @type {any[]} */
@@ -244,6 +420,16 @@ export function compileScripts (source, options = {}) {
         warnings.push(`block ${id} (${opcode}): <field> without a name was skipped`)
         continue
       }
+      // A field the block does not have is written to the archive and read by nobody, so
+      // a misspelled dropdown name (`CURRENT_OPTION` for `CURRENTMENU`) is a silent
+      // no-op. Only blocks the generated table describes are judged; an extension
+      // block's fields are its own business.
+      const knownFields = BLOCK_FIELDS[opcode]
+      if (knownFields !== undefined && !knownFields.includes(name)) {
+        warnings.push(`block ${id} (${opcode}) has no field named "${name}"; its fields are ` +
+          (knownFields.length === 0 ? '(none)' : knownFields.map((field) => `"${field}"`).join(', ')) +
+          '. A field the block does not have is stored and never read')
+      }
       const fieldId = field.attributes.id
       block.fields[name] = fieldId === undefined ? [field.text] : [field.text, fieldId]
     }
@@ -251,8 +437,9 @@ export function compileScripts (source, options = {}) {
     const mutation = childElement(element, 'mutation')
     if (mutation !== undefined) {
       // All mutation payload is string-valued on the wire (argumentids is itself a
-      // JSON string), so the attribute map passes through unchanged.
-      block.mutation = { ...mutation.attributes }
+      // JSON string), so the attribute map passes through — normalised, because the
+      // editor reads fields a hand-written mutation does not have.
+      block.mutation = normalizeMutation(opcode, mutation.attributes, errors)
     }
 
     const commentElement = childElement(element, 'comment')
@@ -270,6 +457,15 @@ export function compileScripts (source, options = {}) {
         warnings.push(`block ${id} (${opcode}): <${input.name}> without a name was skipped`)
         continue
       }
+      checkInputShape({
+        parentOpcode: opcode,
+        parentId: id,
+        inputName: name,
+        isStatement: input.name === 'statement',
+        shadow: childElements(input, 'shadow')[0],
+        errors,
+        warnings
+      })
       const compiled = compileInput(input, id, warnings, newId, compileBlock)
       if (compiled !== null) block.inputs[name] = compiled
     }
@@ -306,8 +502,18 @@ export function compileScripts (source, options = {}) {
   }
 
   const fragment = { blocks, topLevelIds, variables, comments, warnings }
-  resolveProcedures(fragment, warnings, newId)
+  resolveProcedures(fragment, warnings, errors, newId, options.procedures)
   placeComments(fragment)
+
+  // Refuse the whole fragment when the XML would produce a project the editor cannot
+  // open. Half a project is harder to diagnose than one sentence, and "it applied, but
+  // nothing happens" is the most expensive failure mode this compiler has.
+  if (errors.length > 0) {
+    throw new ScriptCompileError(
+      `${errors.length} problem(s) would make the project unusable:\n` +
+      errors.map((error) => `  - ${error}`).join('\n')
+    )
+  }
   return fragment
 }
 
@@ -358,14 +564,41 @@ const parseArray = (value) => {
  * Anything already spelled out is used as given, and a call may name its inputs by
  * argument NAME instead of by id — the ids are filled in from the definition.
  *
+ * `known` seeds the table with the custom blocks the TARGET already has. That is the
+ * append case, and it used to be the caller's problem: a call written into an existing
+ * project has no definition in the same fragment, so there was nothing to copy the
+ * argument ids from, and the authoring guide's advice ("never write argumentids by hand")
+ * was simply impossible to follow. With the target's own definitions passed in, a call
+ * is resolved by `proccode` and addressed by the ids the definition already uses.
+ *
  * @param {{blocks: Record<string, any>, warnings: string[]}} fragment the compiled fragment, mutated in place
  * @param {string[]} warnings collector
+ * @param {string[]} errors collector for calls that cannot be made to work
  * @param {() => string} newId id generator
+ * @param {Iterable<{proccode: string, argumentids?: any, argumentnames?: any, warp?: any}>} [known] the target's existing custom blocks
  */
-const resolveProcedures = (fragment, warnings, newId) => {
+const resolveProcedures = (fragment, warnings, errors, newId, known) => {
   const blocks = fragment.blocks
   /** @type {Map<string, {proccode: string, ids: string[], names: string[], warp: string}>} */
   const byProccode = new Map()
+
+  // Existing definitions first: a fragment that redefines one of them wins below, but
+  // a call that names only one of them resolves either way.
+  for (const declaration of known ?? []) {
+    if (declaration === null || typeof declaration !== 'object') continue
+    const proccode = declaration.proccode
+    if (typeof proccode !== 'string' || proccode.length === 0 || byProccode.has(proccode)) continue
+    const count = (proccode.match(PLACEHOLDER) ?? []).length
+    let ids = parseArray(declaration.argumentids)
+    if (ids === null || ids.length !== count) ids = (declaration.argumentnames === undefined ? [] : (parseArray(declaration.argumentnames) ?? [])).slice()
+    if (ids.length !== count) continue // an unresolvable declaration is no better than none
+    byProccode.set(proccode, {
+      proccode,
+      ids,
+      names: parseArray(declaration.argumentnames) ?? ids,
+      warp: declaration.warp === true || declaration.warp === 'true' ? 'true' : 'false'
+    })
+  }
 
   for (const id of Object.keys(blocks)) {
     const block = blocks[id]
@@ -457,9 +690,23 @@ const resolveProcedures = (fragment, warnings, newId) => {
     const definition = byProccode.get(proccode)
     if (definition === undefined) {
       // A call may legitimately target a definition that already exists in the
-      // target (append mode), so this is only a problem when the ids are missing.
-      if (parseArray(block.mutation?.argumentids) === null) {
-        warnings.push(`call to "${proccode}" has no matching definition in this fragment and no argumentids; its arguments cannot be resolved`)
+      // target (append mode) — but then the ids have to come from somewhere, and a
+      // bare `argumentids="[]"` on a block that takes parameters is a call that
+      // silently passes nothing. Say so instead of writing it.
+      const placeholders = (proccode.match(PLACEHOLDER) ?? []).length
+      // A proccode with no placeholders needs no ids at all, so their absence is fine.
+      const declared = parseArray(block.mutation?.argumentids) ?? (placeholders === 0 ? [] : null)
+      if (declared === null || declared.length !== placeholders) {
+        errors.push(`call to "${proccode}": no definition of it is in this fragment or in the target, so its ${placeholders} ` +
+          'argument id(s) cannot be filled in. Define the block first, or place the call in the same XML as its definition.')
+      } else {
+        block.mutation = {
+          tagName: 'mutation',
+          children: [],
+          proccode,
+          argumentids: JSON.stringify(declared),
+          warp: block.mutation?.warp === undefined ? 'false' : String(block.mutation.warp)
+        }
       }
       continue
     }
@@ -480,6 +727,43 @@ const resolveProcedures = (fragment, warnings, newId) => {
       warp: definition.warp
     }
   }
+}
+
+/**
+ * Collect the custom blocks a target's block map already declares.
+ *
+ * The result is the `procedures` option of {@link compileScripts}: it is what lets a
+ * fragment appended to an existing project call a custom block that is already there.
+ * Prototypes are preferred because they are the only element that carries
+ * `argumentnames`, and the names are what a caller writing XML actually knows.
+ *
+ * @param {Record<string, any>|any[]} blocks a target's block map (or a list of blocks, in either representation)
+ * @returns {{proccode: string, argumentids: any, argumentnames: any, warp: any}[]} the declarations
+ */
+export const proceduresFromBlocks = (blocks) => {
+  /** @type {Map<string, any>} */
+  const byProccode = new Map()
+  /** @type {Map<string, boolean>} */
+  const complete = new Map()
+  for (const block of Array.isArray(blocks) ? blocks : Object.values(blocks ?? {})) {
+    if (Array.isArray(block) || block === null || typeof block !== 'object') continue
+    const mutation = block.mutation
+    const proccode = mutation?.proccode
+    if (typeof proccode !== 'string' || proccode.length === 0) continue
+    // A prototype addresses its arguments by id and names them; a definition and a
+    // call both carry the same ids, so any of the three is usable, just less complete.
+    const isPrototype = block.opcode === 'procedures_prototype' || mutation.argumentnames !== undefined
+    if (byProccode.has(proccode) && complete.get(proccode) === true) continue
+    if (byProccode.has(proccode) && !isPrototype) continue
+    byProccode.set(proccode, {
+      proccode,
+      argumentids: mutation.argumentids,
+      argumentnames: mutation.argumentnames,
+      warp: mutation.warp
+    })
+    complete.set(proccode, isPrototype)
+  }
+  return [...byProccode.values()]
 }
 
 /**

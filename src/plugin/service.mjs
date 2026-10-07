@@ -53,6 +53,8 @@ export class BridgeService {
   #lastError = null
   /** @type {{sessionId: string, at: number}|null} */
   #lease = null
+  /** @type {string|null} */
+  #lastRun = null
   /** Tail of the serialisation chain. */
   #queue = Promise.resolve()
 
@@ -210,26 +212,96 @@ export class BridgeService {
 
   /**
    * Enforce the lease for a mutating operation.
+   *
+   * The idle window is short on purpose. A lease is only ever refreshed by its holder
+   * actually working, so a holder that has gone away — a subagent that crashed, a
+   * session the user closed — freezes the editor for exactly this long. Five minutes of
+   * that cost a delivery three rounds of pure waiting, and the thing it was waiting for
+   * was a corpse. A minute is long enough for a session that is mid-thought and short
+   * enough to walk away from, and `gandi_lease` covers the case where even that is too
+   * long to wait.
+   *
    * @param {string} sessionId the requesting session
    * @param {boolean} force whether the caller asked to take over
    */
   #checkLease (sessionId, force) {
-    const idleMs = this.#config.leaseIdleMs ?? 300000
+    const idleMs = this.#config.leaseIdleMs ?? 60000
     if (this.#lease !== null && this.#lease.sessionId !== sessionId) {
       const idle = Date.now() - this.#lease.at
       if (idle < idleMs && !force) {
         throw new LeaseConflictError(
           `session ${this.#lease.sessionId} is driving Gandi (idle ${Math.round(idle / 1000)}s of ` +
-          `${Math.round(idleMs / 1000)}s). Wait for it, or pass force: true to take over.`
+          `${Math.round(idleMs / 1000)}s). Wait for it, pass force: true to take over, ` +
+          'or call gandi_lease {action: "take"} if you mean to keep it.'
         )
       }
-      if (force) this.#log(`session ${sessionId} took the lease from ${this.#lease.sessionId}`)
+      if (force) this.#log(`session ${sessionId} took the lease from ${this.#lease.sessionId} by force`)
     }
   }
 
   /** Release the lease if the given session holds it. */
   releaseLease (sessionId) {
     if (this.#lease !== null && this.#lease.sessionId === sessionId) this.#lease = null
+  }
+
+  /**
+   * Remember how the last run went, so `gandi_status` can report it.
+   *
+   * A run's most important symptom is often the one that happened one call ago — a
+   * page error during the run, or a run that started no threads at all. Without this
+   * the only way back to it is to run the project again and hope it repeats.
+   *
+   * @param {string} summary one line
+   */
+  noteRun (summary) {
+    this.#lastRun = summary
+  }
+
+  /** One line about the last run, or null. */
+  get lastRun () {
+    return this.#lastRun
+  }
+
+  /**
+   * Read or change the lease by hand.
+   *
+   * Nothing here can notice that a holder has died: an agent session does not tell the
+   * plugin when it ends. The idle timeout was therefore the only reclamation, and
+   * waiting it out was the only escape. This is the third way out, and the only one that
+   * leaves the lease in a state the caller chose: `status` says who holds it, `release`
+   * gives it up as its holder, and `take` claims it outright.
+   *
+   * @param {{action: 'status'|'release'|'take', sessionId: string}} request what to do
+   * @returns {{action: string, lease: {sessionId: string, idleMs: number}|null, idleMs: number, note: string}} the resulting state
+   */
+  lease (request) {
+    const idleMs = this.#config.leaseIdleMs ?? 60000
+    const before = this.#lease === null ? null : { sessionId: this.#lease.sessionId, idleMs: Date.now() - this.#lease.at }
+    let note = ''
+    if (request.action === 'take') {
+      note = before === null
+        ? 'the lease was free; you hold it now'
+        : `took the lease from ${before.sessionId} (it had been idle ${Math.round(before.idleMs / 1000)}s)`
+      this.#lease = { sessionId: request.sessionId, at: Date.now() }
+    } else if (request.action === 'release') {
+      if (before === null) note = 'the lease was already free'
+      else if (before.sessionId !== request.sessionId) {
+        note = `session ${before.sessionId} holds the lease, not you — call gandi_lease {action: "take"} to take it`
+      } else {
+        this.#lease = null
+        note = 'released; the next mutating call from any session can take it'
+      }
+    } else {
+      note = before === null
+        ? 'the lease is free'
+        : `held by ${before.sessionId}, idle ${Math.round(before.idleMs / 1000)}s of ${Math.round(idleMs / 1000)}s`
+    }
+    return {
+      action: request.action,
+      idleMs,
+      lease: this.#lease === null ? null : { sessionId: this.#lease.sessionId, idleMs: Date.now() - this.#lease.at },
+      note
+    }
   }
 
   /**
@@ -293,6 +365,8 @@ export class BridgeService {
       autoLaunch: this.#config.autoLaunch === true,
       processRunning: running,
       lease: this.#lease === null ? null : { sessionId: this.#lease.sessionId, idleMs: Date.now() - this.#lease.at },
+      leaseIdleMs: this.#config.leaseIdleMs ?? 60000,
+      lastRun: this.#lastRun,
       lastError: this.#lastError === null ? null : this.#lastError.message
     }
   }

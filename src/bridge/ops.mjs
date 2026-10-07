@@ -200,7 +200,8 @@ export async function applyFragment (connection, request) {
       blocks: request.blocks,
       variables: request.variables ?? [],
       comments: request.comments ?? [],
-      mode
+      mode,
+      script: request.script ?? null
     })}
 
     const resolveTarget = () => {
@@ -234,12 +235,31 @@ export async function applyFragment (connection, request) {
 
     const before = Object.keys(target.blocks._blocks).length
     let removed = 0
-    if (args.mode === 'replace') {
+    let replacedScript = null
+    if (args.mode === 'replace' || args.mode === 'replaceScript') {
       // SNAPSHOT the script list before deleting any of it. getScripts() hands back
       // the runtime's own array, and deleteBlock shortens it, so iterating it while
       // deleting skips every second script — silently, and only when a target has
       // more than one, which is why it survived so long.
-      for (const scriptId of [...target.blocks.getScripts()]) {
+      const scripts = [...target.blocks.getScripts()]
+      let doomed = scripts
+      if (args.mode === 'replaceScript') {
+        // A single script, named by id or by 1-based position in the script list. The
+        // position is what a caller can actually see: gandi_inspect prints scripts in
+        // this order, and a block id is only available to someone who already has the
+        // XML in hand.
+        const wanted = args.script
+        const byIndex = typeof wanted === 'number' ? scripts[wanted - 1] : undefined
+        const byId = typeof wanted === 'string' && scripts.includes(wanted) ? wanted : undefined
+        const chosen = byIndex !== undefined ? byIndex : byId
+        if (chosen === undefined) {
+          throw new Error('no such script: ' + JSON.stringify(wanted) + ' — this target has ' + scripts.length +
+            ' top-level script(s); pass a 1-based number, or one of their ids: ' + scripts.join(', '))
+        }
+        doomed = [chosen]
+        replacedScript = chosen
+      }
+      for (const scriptId of doomed) {
         // deleteBlock cascades through the stack on the runtime side.
         target.blocks.deleteBlock(scriptId)
         removed++
@@ -248,7 +268,7 @@ export async function applyFragment (connection, request) {
 
     // Deleting the scripts can leave blocks nothing points at any more. Cleaning
     // them up here is what keeps "replace" from accumulating invisible junk.
-    const removedOrphans = args.mode === 'replace' ? pruneOrphans() : 0
+    const removedOrphans = args.mode === 'append' ? 0 : pruneOrphans()
 
     // A comment whose block no longer exists is a note pointing at nothing, which is
     // what a deleted script would leave behind. Checked AFTER the delete rather than
@@ -309,6 +329,7 @@ export async function applyFragment (connection, request) {
     return {
       target: { id: target.id, name: target.getName() },
       mode: args.mode,
+      replacedScript,
       removedScripts: removed,
       createdBlocks: created.length,
       createdVariables,
@@ -381,9 +402,19 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
  *      not polled per frame (Gandi's `scratch3_event.js` listens for it and calls
  *      `startHats`), so the key has to be posted while the project is stepping.
  *
+ * The editor's OWN stepping loop is paused for the duration, and that is what makes a
+ * run reproducible. `runtime.start()` — which the GUI calls the first time the user
+ * presses the green flag — arms `runtime.frameLoop`, a 30 Hz `setInterval` whose
+ * callback is `runtime._step`. A bridge-driven run would then advance the project twice
+ * per frame of real time, and only while the window is in the foreground (a background
+ * page's timers are throttled): a delivery measured its frame counter at 1.85x the
+ * frames reported here, retuned every physics constant for it, and got a game that ran
+ * at half speed whenever nobody was looking at the window. With the loop paused the
+ * rate is exactly `1000 / runtime.currentStepTime`, whatever the window is doing.
+ *
  * @param {import('./cdp.mjs').CdpConnection} connection open connection
  * @param {{seconds?: number, stopAfter?: boolean, mode?: 'paced'|'turbo', maxSteps?: number, events?: {atFrame: number, source: string}[]}} [options] run options
- * @returns {Promise<any>} steps taken, threads started/left, and the run duration
+ * @returns {Promise<any>} steps taken, threads started/left, the run duration, and any page errors seen during the run
  */
 export async function runSteps (connection, options = {}) {
   const seconds = options.seconds ?? 1
@@ -420,6 +451,35 @@ export async function runSteps (connection, options = {}) {
       thread.blockGlowInFrame = null
     }
 
+    // Pause the editor's own stepping loop so this run is paced by the bridge alone.
+    const runtime = vm.runtime
+    vm.__dshGandiLoopWasRunning = false
+    if (runtime.frameLoop !== undefined && runtime.frameLoop !== null && runtime.frameLoop.running === true) {
+      runtime.frameLoop.stop()
+      vm.__dshGandiLoopWasRunning = true
+    } else if (runtime._steppingInterval !== undefined && runtime._steppingInterval !== null) {
+      clearInterval(runtime._steppingInterval)
+      runtime._steppingInterval = null
+      vm.__dshGandiLoopWasRunning = true
+    }
+
+    // Collect page errors for the duration of the run. This runtime reports its worst
+    // failures as rejected promises carrying a bare string (the glow error above is
+    // one), so without a listener they vanish and the only symptom is "nothing
+    // happened".
+    if (globalThis.__dshGandiErrorHooks !== true) {
+      globalThis.__dshGandiErrorHooks = true
+      const record = (message) => {
+        if (globalThis.__dshGandiCollectErrors !== true) return
+        const log = globalThis.__dshGandiErrorLog
+        if (log.length < 20) log.push(String(message).slice(0, 300))
+      }
+      window.addEventListener('error', (event) => record(event.message || (event.error && event.error.message) || 'window error'))
+      window.addEventListener('unhandledrejection', (event) => record((event.reason && event.reason.message) || event.reason || 'unhandled rejection'))
+    }
+    globalThis.__dshGandiErrorLog = []
+    globalThis.__dshGandiCollectErrors = true
+
     vm.greenFlag()
     return {
       stepMs: vm.runtime.currentStepTime,
@@ -429,33 +489,57 @@ export async function runSteps (connection, options = {}) {
 
   const steps = Math.min(maxSteps, Math.ceil((seconds * 1000) / started.stepMs))
 
-  if (mode === 'turbo') {
-    await evaluate(connection, `(() => {\n${vmBootstrapSource()}\n${events.map((event) => `{ ${event.source} }`).join('\n')}\nfor (let i = 0; i < ${steps}; i++) vm.runtime._step()\nreturn true\n})()`, { timeoutMs: 120000 })
-    fired = events.length
-  } else {
-    const wallStart = Date.now()
-    for (let index = 0; index < steps; index++) {
-      while (fired < events.length && events[fired].atFrame <= index) {
-        const event = events[fired]
-        await evaluate(connection, `(() => {\n${vmBootstrapSource()}\n${event.source}\nreturn true\n})()`, { timeoutMs: 10000 })
-        fired++
-      }
-      await evaluate(connection, `(() => {\n${vmBootstrapSource()}vm.runtime._step();\nreturn true\n})()`, { timeoutMs: 10000 })
-      const dueAt = wallStart + (index + 1) * started.stepMs
-      const remaining = dueAt - Date.now()
-      if (remaining > 0) await sleep(remaining)
-    }
-  }
-
-  const finished = JSON.parse(await evaluate(connection, `JSON.stringify((() => {\n${vmBootstrapSource()}
-        const result = { threadsLeft: vm.runtime.threads.length }
-    if (${JSON.stringify(stopAfter)}) { vm.stopAll(); result.stopped = true }
+  /**
+   * Undo the two pieces of editor state this run borrowed. Called on the way out AND
+   * after a failure: a run that threw halfway through must not leave the user's editor
+   * with its stepping loop stopped and glow disabled.
+   */
+  const release = async (stop) => JSON.parse(await evaluate(connection, `JSON.stringify((() => {\n${vmBootstrapSource()}
+    const result = { threadsLeft: vm.runtime.threads.length }
+    if (${JSON.stringify(stop === true)}) { vm.stopAll(); result.stopped = true }
     // Put the glow settings back: they belong to the user's editor, not to the bridge.
     for (const entry of vm.__dshGandiGlowFlags ?? []) entry.container.forceNoGlow = entry.previous
     delete vm.__dshGandiGlowFlags
+    // ...and give the editor its own stepping loop back, but only if it had one.
+    if (vm.__dshGandiLoopWasRunning === true && vm.runtime.frameLoop !== undefined && vm.runtime.frameLoop !== null) {
+      vm.runtime.start()
+      result.loopRestored = true
+    } else if (vm.__dshGandiLoopWasRunning === true && (vm.runtime._steppingInterval === undefined || vm.runtime._steppingInterval === null)) {
+      vm.runtime.start()
+      result.loopRestored = true
+    }
+    delete vm.__dshGandiLoopWasRunning
+    globalThis.__dshGandiCollectErrors = false
+    result.errors = [...(globalThis.__dshGandiErrorLog ?? [])]
     return result
   })())`, { timeoutMs: 30000 }))
 
+  try {
+    if (mode === 'turbo') {
+      await evaluate(connection, `(() => {\n${vmBootstrapSource()}\n${events.map((event) => `{ ${event.source} }`).join('\n')}\nfor (let i = 0; i < ${steps}; i++) vm.runtime._step()\nreturn true\n})()`, { timeoutMs: 120000 })
+      fired = events.length
+    } else {
+      const wallStart = Date.now()
+      for (let index = 0; index < steps; index++) {
+        while (fired < events.length && events[fired].atFrame <= index) {
+          const event = events[fired]
+          await evaluate(connection, `(() => {\n${vmBootstrapSource()}\n${event.source}\nreturn true\n})()`, { timeoutMs: 10000 })
+          fired++
+        }
+        await evaluate(connection, `(() => {\n${vmBootstrapSource()}vm.runtime._step();\nreturn true\n})()`, { timeoutMs: 10000 })
+        const dueAt = wallStart + (index + 1) * started.stepMs
+        const remaining = dueAt - Date.now()
+        if (remaining > 0) await sleep(remaining)
+      }
+    }
+  } catch (error) {
+    // Best effort: the connection may be the thing that broke. The original failure is
+    // what the caller needs to see, so a failed cleanup is swallowed.
+    await release(true).catch(() => undefined)
+    throw error
+  }
+
+  const finished = await release(stopAfter)
   return {
     mode,
     stepMs: started.stepMs,
@@ -501,6 +585,11 @@ export async function observe (connection, options = {}) {
         sounds: t.sprite ? t.sprite.sounds.map((s) => s.name) : [],
         scripts: t.blocks.getScripts().length,
         blocks: Object.keys(t.blocks._blocks).length,
+        // Clones of THIS sprite, counted off the full target list even when clone
+        // targets themselves are filtered out of the report. "Zero clones" is the
+        // single most useful signal for a cloning bug — a delivery shipped a game
+        // where nothing spawned and only found out by asking for a state dump.
+        clones: runtime.targets.filter((other) => !other.isOriginal && other.getName() === t.getName() && other.isStage === t.isStage).length,
         variables: Object.values(t.variables).map((v) => ({ name: v.name, type: v.type, value: v.value }))
       }))
     // getMonitorState() hands back the monitor RECORD container, not a map of monitor
@@ -1161,6 +1250,163 @@ export async function getTargetXml (connection, request = {}) {
     scripts: fragment.topLevelIds.length,
     comments: fragment.comments.length
   }
+}
+
+/**
+ * Read the custom blocks a target already declares.
+ *
+ * This is what makes an appended fragment able to CALL a custom block that is already
+ * in the project: the argument ids live in the target's own prototype, and nothing else
+ * can supply them. The blocks are handed back as `{opcode, mutation}` pairs and the
+ * collection itself happens in Node (`proceduresFromBlocks`), so the live and offline
+ * paths agree by construction rather than by two implementations of the same rule.
+ *
+ * @param {import('./cdp.mjs').CdpConnection} connection open connection
+ * @param {{target?: string}} [request] which sprite; defaults to the editing target
+ * @returns {Promise<{target: string, blocks: {opcode: string, mutation: any}[]}>} the declarations
+ */
+export async function getProcedureDeclarations (connection, request = {}) {
+  const raw = await evaluate(connection, `JSON.stringify((() => {\n${RESOLVE_TARGET_SOURCE}
+    const ref = ${JSON.stringify(request.target ?? null)}
+    const target = resolveTarget(ref)
+    if (target === null) throw new Error('no such sprite: ' + ref)
+    return {
+      target: target.getName(),
+      blocks: Object.values(target.blocks._blocks)
+        .filter((block) => block !== null && typeof block === 'object' && !Array.isArray(block) &&
+          block.mutation !== undefined && block.mutation !== null && typeof block.mutation.proccode === 'string')
+        .map((block) => ({ opcode: block.opcode, mutation: block.mutation }))
+    }
+  })())`, { timeoutMs: 30000 })
+  return JSON.parse(raw)
+}
+
+/**
+ * Rename or delete one costume (or backdrop).
+ *
+ * Both are Target methods, not VM methods: `vm.renameCostume(index, name)` and
+ * `vm.deleteCostume(index)` act on the EDITING target only, so using them would rename
+ * whatever happens to be selected. The signatures were read off the live runtime:
+ *
+ *   - `target.renameCostume(index, name, fireEvent = true)` runs the name through
+ *     scratch-vm's `unusedName`, so it may come back with a suffix — the caller is told
+ *     the name that was actually set, not the one it asked for;
+ *   - `target.deleteCostume(index, fireEvent?)` returns null for an out-of-range index
+ *     AND for the last remaining costume, because a target with no costume cannot be
+ *     rendered. That is reported rather than thrown, so a caller can decide.
+ *
+ * @param {import('./cdp.mjs').CdpConnection} connection open connection
+ * @param {{target?: string, action: 'rename'|'delete', name?: string, newName?: string, index?: number}} request what to change
+ * @returns {Promise<any>} the resulting costume list
+ */
+export async function editCostume (connection, request) {
+  const raw = await evaluate(connection, `JSON.stringify((() => {\n${RESOLVE_TARGET_SOURCE}
+    const target = resolveTarget(${JSON.stringify(request.target ?? null)})
+    if (target === null) throw new Error('no such target: ' + ${JSON.stringify(request.target ?? null)})
+    const index = ${JSON.stringify(Number.isInteger(request.index) ? request.index : null)} !== null
+      ? ${JSON.stringify(Number.isInteger(request.index) ? request.index : null)}
+      : target.getCostumeIndexByName(${JSON.stringify(request.name ?? '')})
+    const before = target.getCostumes().map((costume) => costume.name)
+    if (index === null || index < 0 || index >= before.length) {
+      throw new Error('no such costume: ' + ${JSON.stringify(request.name ?? `index ${request.index}`)} + ' (this target has: ' + before.join(', ') + ')')
+    }
+    const action = ${JSON.stringify(request.action)}
+    if (action === 'rename') {
+      target.renameCostume(index, ${JSON.stringify(request.newName ?? '')})
+      const actual = target.getCostumes()[index].name
+      return { target: target.getName(), isStage: target.isStage, action, requested: ${JSON.stringify(request.newName ?? '')}, name: actual, costumes: target.getCostumes().map((costume) => costume.name), renamed: actual !== before[index] }
+    }
+    if (action === 'delete') {
+      const removed = target.deleteCostume(index)
+      if (removed === null || removed === undefined) {
+        // Either the index went stale or this is the only costume left; the second is
+        // the one a caller hits, and it is not an error in the runtime.
+        throw new Error(before.length === 1
+          ? 'a target cannot be left with no costume at all, so the last one cannot be deleted'
+          : 'the costume at index ' + index + ' could not be deleted')
+      }
+      return { target: target.getName(), isStage: target.isStage, action, name: before[index], costumes: target.getCostumes().map((costume) => costume.name) }
+    }
+    throw new Error('unknown costume action: ' + action)
+  })())`, { timeoutMs: 30000 })
+  const result = JSON.parse(raw)
+  // The rename/delete bookkeeping the editor does around these events is worth one
+  // round trip: without it the costume TAB keeps showing the old name until the user
+  // switches sprites, which reads as "the rename did not work".
+  await evaluate(connection, `(() => {\n${vmBootstrapSource()}vm.emitWorkspaceUpdate();\nreturn true\n})()`, { timeoutMs: 15000 }).catch(() => undefined)
+  return result
+}
+
+/**
+ * Rename or delete one sound.
+ *
+ * Same shape as {@link editCostume}, with one difference that matters: renaming a sound
+ * also rewrites every `sound_play` block that named it (`Target.renameSound` calls
+ * `blocks.updateAssetName`), while deleting one does not — a script that played the
+ * deleted sound keeps its name and plays nothing. The caller is told how many blocks
+ * were rewritten.
+ *
+ * @param {import('./cdp.mjs').CdpConnection} connection open connection
+ * @param {{target?: string, action: 'rename'|'delete', name?: string, newName?: string, index?: number}} request what to change
+ * @returns {Promise<any>} the resulting sound list
+ */
+export async function editSound (connection, request) {
+  const raw = await evaluate(connection, `JSON.stringify((() => {\n${RESOLVE_TARGET_SOURCE}
+    const target = resolveSprite(${JSON.stringify(request.target ?? null)})
+    if (target === null) throw new Error('no such sprite: ' + ${JSON.stringify(request.target ?? null)})
+    const sounds = target.getSounds()
+    const index = ${JSON.stringify(Number.isInteger(request.index) ? request.index : null)} !== null
+      ? ${JSON.stringify(Number.isInteger(request.index) ? request.index : null)}
+      : sounds.findIndex((sound) => sound.name === ${JSON.stringify(request.name ?? '')})
+    const before = sounds.map((sound) => sound.name)
+    if (index < 0 || index >= before.length) {
+      throw new Error('no such sound: ' + ${JSON.stringify(request.name ?? `index ${request.index}`)} + ' (this sprite has: ' + (before.join(', ') || 'none') + ')')
+    }
+    const action = ${JSON.stringify(request.action)}
+    if (action === 'rename') {
+      target.renameSound(index, ${JSON.stringify(request.newName ?? '')})
+      const actual = target.getSounds()[index].name
+      return { target: target.getName(), action, requested: ${JSON.stringify(request.newName ?? '')}, name: actual, sounds: target.getSounds().map((sound) => sound.name) }
+    }
+    if (action === 'delete') {
+      target.deleteSound(index)
+      return { target: target.getName(), action, name: before[index], sounds: target.getSounds().map((sound) => sound.name) }
+    }
+    throw new Error('unknown sound action: ' + action)
+  })())`, { timeoutMs: 30000 })
+  const result = JSON.parse(raw)
+  await evaluate(connection, `(() => {\n${vmBootstrapSource()}vm.emitWorkspaceUpdate();\nreturn true\n})()`, { timeoutMs: 15000 }).catch(() => undefined)
+  return result
+}
+
+/**
+ * Return every ordinary variable and list to a fresh starting value.
+ *
+ * This is NOT a restore of the project's declared initial values — those live in the
+ * file and are overwritten the moment a script writes to them, so the runtime no longer
+ * knows them. What it does is the thing a Scratch author does by hand in an init script:
+ * scalars become 0 and lists become empty. Broadcast messages are left alone: they are
+ * stored as variables of type `broadcast_msg` on the stage, and zeroing one would blank
+ * the message's own name.
+ *
+ * @param {import('./cdp.mjs').CdpConnection} connection open connection
+ * @returns {Promise<any>} how many variables were reset
+ */
+export async function resetVariables (connection) {
+  const raw = await evaluate(connection, `JSON.stringify((() => {\n${vmBootstrapSource()}
+    const changed = []
+    for (const target of vm.runtime.targets) {
+      if (!target.isOriginal) continue
+      for (const variable of Object.values(target.variables ?? {})) {
+        if (variable.type === 'broadcast_msg') continue
+        const was = variable.type === 'list' ? '[' + (Array.isArray(variable.value) ? variable.value.length : 0) + ' items]' : String(variable.value)
+        variable.value = variable.type === 'list' ? [] : 0
+        changed.push(target.getName() + '.' + variable.name + ': ' + was + ' -> ' + (variable.type === 'list' ? '[]' : '0'))
+      }
+    }
+    return { reset: changed.length, changed }
+  })())`, { timeoutMs: 30000 })
+  return JSON.parse(raw)
 }
 
 /**

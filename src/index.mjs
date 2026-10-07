@@ -21,13 +21,16 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { DEFAULT_BACKDROP_SVG, DEFAULT_SPRITE_SVG, blankProject, readSb3, starterProject, writeSb3 } from './scratch/sb3.mjs'
-import { applyFragmentToProject, summarizeProject, targetXmlFromProject } from './scratch/project.mjs'
+import { applyFragmentToProject, findProjectTarget, summarizeProject, targetXmlFromProject } from './scratch/project.mjs'
+import { formatMerge, mergeProjects } from './scratch/merge.mjs'
+import { formatReport, verifyProject } from './scratch/verify.mjs'
 import { SAMPLE_RATE, encodeWav, synthesizeTone } from './scratch/wav.mjs'
-import { compileScripts, randomBlockId } from './scratch/xml.mjs'
+import { compileScripts, proceduresFromBlocks, randomBlockId } from './scratch/xml.mjs'
 import { fragmentToEngine } from './scratch/engine.mjs'
 import { assertLooksLikeSvg, defaultRotationCenter } from './scratch/svg.mjs'
 import { isPostableKey, knownKeyNames, toDomKey } from './scratch/keys.mjs'
@@ -36,9 +39,12 @@ import {
   addSound,
   applyFragment,
   duplicateSprite,
+  editCostume,
   editSprite,
+  editSound,
   editVariable,
   exportSb3,
+  getProcedureDeclarations,
   getTargetXml,
   keepOnlyCostume,
   loadProjectBytes,
@@ -46,6 +52,7 @@ import {
   observe,
   postKey,
   postMouse,
+  resetVariables,
   runSteps,
   screenshot,
   selectTarget,
@@ -92,7 +99,7 @@ const resolveConfig = (config = {}) => {
     autoLaunch: typeof config.autoLaunch === 'boolean'
       ? config.autoLaunch
       : (envAuto === undefined ? false : envAuto === '1' || envAuto === 'true'),
-    leaseIdleMs: Number.isInteger(config.leaseIdleMs) && config.leaseIdleMs > 0 ? config.leaseIdleMs : 300000,
+    leaseIdleMs: Number.isInteger(config.leaseIdleMs) && config.leaseIdleMs > 0 ? config.leaseIdleMs : 60000,
     launchTimeoutMs: Number.isInteger(config.launchTimeoutMs) && config.launchTimeoutMs > 0 ? config.launchTimeoutMs : 45000,
     maxTextChars: Number.isInteger(config.maxTextChars) && config.maxTextChars > 0 ? config.maxTextChars : 20000,
     screenshotOnRun: config.screenshotOnRun !== false,
@@ -138,6 +145,20 @@ const LAUNCH_OUTPUT = {
     ready: { type: 'boolean' }
   },
   required: ['text']
+}
+
+/**
+ * The one parameter every mutating tool gains, added centrally in `registerTool`.
+ *
+ * It exists because the lease conflict message told callers to "pass force: true to take
+ * over" while no tool's schema accepted it — and a registry that validates arguments
+ * with `additionalProperties: false` drops what it does not know, so the parameter never
+ * arrived. A delivery tried it twice and got a byte-identical error. Injecting it in one
+ * place is also what keeps the promise from rotting the next time a tool is added.
+ */
+const FORCE_PARAMETER = {
+  type: 'boolean',
+  description: 'Take the edit lease even while another session holds it, instead of waiting for it to go idle. Use when the holder has gone away, or when the editor is stuck mid-edit and reading a file from disk is the way out.'
 }
 
 // ── plugin ──────────────────────────────────────────────────────────────────
@@ -214,6 +235,36 @@ export function apply (ctx, rowConfig = {}) {
     }
     return JSON.stringify(String(value))
   }
+
+  /**
+   * Whether two Scratch values read the same, for the run report's "changed" list.
+   *
+   * Deliberately loose: Scratch has one number type, so 1 and "1" are the same value to
+   * every block that will ever read them, and reporting that as a change would be noise.
+   *
+   * @param {unknown} a the value before
+   * @param {unknown} b the value after
+   * @returns {boolean} true when they read the same
+   */
+  const sameValue = (a, b) => {
+    if (Array.isArray(a) || Array.isArray(b)) {
+      return JSON.stringify(a ?? []) === JSON.stringify(b ?? [])
+    }
+    if (a === null || a === undefined || b === null || b === undefined) return a === b
+    if (typeof a === 'number' || typeof b === 'number') return Number(a) === Number(b) || String(a) === String(b)
+    return String(a) === String(b)
+  }
+
+  /**
+   * Hash of the last stage image handed out by `gandi_run`.
+   *
+   * Kept so a capture that repeats byte-for-byte can be called out. A delivery judged
+   * three runs by an image that never changed and concluded the stage was not rendering;
+   * the same bytes arriving twice is information, and hiding it is what made that
+   * expensive.
+   * @type {string|null}
+   */
+  let lastStageHash = null
 
   const requireString = (value, label) => {
     if (typeof value !== 'string' || value.trim().length === 0) {
@@ -309,17 +360,34 @@ export function apply (ctx, rowConfig = {}) {
   }
 
   /**
+   * The access a mutating tool asks for.
+   *
+   * `force` is a REAL parameter on every mutating tool (injected in `registerTool`),
+   * because the lease error used to offer it while no tool schema accepted it — and the
+   * registries validate arguments with `additionalProperties: false`, so the parameter
+   * was stripped before it ever reached the service. The advice was unfollowable by
+   * construction, which is worse than having no advice at all.
+   *
+   * @param {any} args the tool arguments
+   * @param {string} sessionId the calling session
+   * @returns {{sessionId: string, mutating: boolean, force: boolean}} the access
+   */
+  const writeAccess = (args, sessionId) => ({ sessionId, mutating: true, force: args?.force === true })
+
+  /**
    * Register one tool. `mutating` tools take the project lease and are serialised
    * against every other tool in this process.
    * @param {{name: string, description: string, parameters: any, schema?: any, mutating?: boolean, concurrencySafe?: boolean, run: (args: any, exec: any, sessionId: string) => Promise<any>}} definition tool definition
    */
   const registerTool = (definition) => {
     const mutating = definition.mutating === true
-    const access = (sessionId) => ({ sessionId, mutating })
+    const parameters = mutating && typeof definition.parameters === 'object' && definition.parameters !== null
+      ? { ...definition.parameters, properties: { ...(definition.parameters.properties ?? {}), force: FORCE_PARAMETER } }
+      : definition.parameters
     ctx.tools.register({
       name: definition.name,
       description: definition.description,
-      parameters: definition.parameters,
+      parameters,
       output: {
         schema: definition.schema ?? TEXT_OUTPUT,
         render: (_args, value) => {
@@ -340,7 +408,6 @@ export function apply (ctx, rowConfig = {}) {
         }
       }
     })
-    void access
   }
 
   // ── status ────────────────────────────────────────────────────────────────
@@ -348,7 +415,11 @@ export function apply (ctx, rowConfig = {}) {
   registerTool({
     name: 'gandi_status',
     concurrencySafe: true,
-    description: 'Report whether the Gandi bridge is reachable, what project is open, and who holds the edit lease. Cheap; call it first when another scratch_* tool fails.',
+    description: [
+      'Report whether the Gandi bridge is reachable, what project is open, and who holds the edit lease.',
+      'When an editor is attached it also reports per sprite: scripts, blocks, clones, costumes and how many variables/lists it owns.',
+      'Cheap; call it first when another gandi_* tool fails, and after a run that "did nothing" — a sprite with 0 clones is the shortest path to a cloning bug.'
+    ].join(' '),
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async run (_args, exec, sessionId) {
       const status = await service.status()
@@ -360,8 +431,9 @@ export function apply (ctx, rowConfig = {}) {
         `app path: ${status.appPath ?? '(not found — set appPath or GANDI_APP_PATH)'}`,
         `auto-launch: ${status.autoLaunch ? 'on' : 'off'}`,
         `workspace: ${cwdOf(exec)}`,
-        `lease: ${status.lease === null ? 'free' : `held by session ${status.lease.sessionId} (idle ${Math.round(status.lease.idleMs / 1000)}s)`}`,
-        `this session: ${sessionId}`
+        `lease: ${status.lease === null ? 'free' : `held by session ${status.lease.sessionId} (idle ${Math.round(status.lease.idleMs / 1000)}s of ${Math.round(status.leaseIdleMs / 1000)}s)`}`,
+        `this session: ${sessionId}`,
+        `last run: ${status.lastRun === null ? '(none since this process started)' : status.lastRun}`
       ]
       if (status.lastError !== null) lines.push(`last error: ${status.lastError}`)
       if (!status.connected) {
@@ -379,11 +451,127 @@ export function apply (ctx, rowConfig = {}) {
         return { text: lines.join('\n') }
       }
       const state = await service.use({ sessionId, mutating: false }, (connection) => observe(connection, { includeClones: false }))
-      lines.push(`editing target: ${state.editingTarget?.name ?? '(none)'}`)
+      lines.push(`editing target: ${state.editingTarget?.name ?? '(none)'}`, `threads: ${state.threads}`)
       for (const target of state.targets) {
-        lines.push(`  ${target.name}${target.isStage ? ' (stage)' : ''}: ${target.scripts} script(s), ${target.blocks} block(s), costumes: ${target.costumes.join(', ') || 'none'}`)
+        const scalars = target.variables.filter((variable) => variable.type !== 'list' && variable.type !== 'broadcast_msg')
+        const lists = target.variables.filter((variable) => variable.type === 'list')
+        const own = target.isStage
+          ? `globals: ${scalars.length} variable(s), ${lists.length} list(s)`
+          : `own: ${scalars.length} variable(s), ${lists.length} list(s)`
+        lines.push(`  ${target.name}${target.isStage ? ' (stage)' : ''}: ${target.scripts} script(s), ${target.blocks} block(s), ` +
+          `${target.clones} clone(s), ${own}, costumes: ${target.costumes.join(', ') || 'none'}` +
+          (target.sounds.length > 0 ? `, sounds: ${target.sounds.join(', ')}` : ''))
       }
       return { text: lines.join('\n') }
+    }
+  })
+
+  // ── lease ─────────────────────────────────────────────────────────────────
+
+  registerTool({
+    name: 'gandi_lease',
+    concurrencySafe: true,
+    description: [
+      'Read or change who may edit the open project.',
+      'Mutating tools take a lease so two sessions cannot drive one editor; it expires after an idle window.',
+      'action "status" (default) reports the holder; "release" gives it up if you hold it; "take" claims it outright —',
+      'which is the way out when the holder has gone away and waiting would be pointless.'
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['status', 'release', 'take'], description: 'What to do (default status).' }
+      },
+      additionalProperties: false
+    },
+    async run (args, exec, sessionId) {
+      const action = args.action === undefined ? 'status' : requireString(args.action, 'action')
+      if (!['status', 'release', 'take'].includes(action)) {
+        throw new Error(`unknown action "${action}"; use status, release or take`)
+      }
+      const result = service.lease({ action, sessionId })
+      return {
+        text: [
+          `${action}: ${result.note}`,
+          `lease: ${result.lease === null ? 'free' : `session ${result.lease.sessionId} (idle ${Math.round(result.lease.idleMs / 1000)}s)`}`,
+          `this session: ${sessionId}`,
+          `idle window: ${Math.round(result.idleMs / 1000)}s (set leaseIdleMs in the plugin config to change it)`
+        ].join('\n')
+      }
+    }
+  })
+
+  // ── load check ────────────────────────────────────────────────────────────
+
+  registerTool({
+    name: 'gandi_verify',
+    concurrencySafe: true,
+    description: [
+      'Check whether the editor will actually OPEN a project file, before anything tries.',
+      'Offline by default: it reads the .sb3 and reports the failures that only show up at load time —',
+      'a block whose opcode is read as an extension id ("Extension not found"), a custom-block mutation missing',
+      'fields the editor dereferences, a dropdown shadow that is not the one the block expects, a field naming a',
+      'variable nothing declares, an asset the archive does not contain.',
+      'Pass live: true to go further and hand the file to the editor\'s own deserializer, restoring whatever was',
+      'open afterwards — the definitive answer, and the only check that can be wrong in neither direction.'
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'A .sb3 (or project.json) on disk to check.' },
+        live: { type: 'boolean', description: 'Also load it in the editor and restore what was open (default false).' },
+        maxIssues: { type: 'number', description: 'How many findings to print per section (default 12).' }
+      },
+      required: ['path'],
+      additionalProperties: false
+    },
+    async run (args, exec, sessionId) {
+      const absolute = resolveProjectPath(requireString(args.path, 'path'), exec)
+      const { project, assets, warnings: containerWarnings } = await readProjectFile(absolute)
+      const report = verifyProject(project, { assets })
+      for (const warning of containerWarnings) report.warnings.push(`archive: ${warning}`)
+
+      const lines = [`checked ${absolute}`, formatReport(report, { heading: 'offline load check' })]
+      if (args.live !== true) {
+        if (report.errors.length > 0) {
+          lines.push('This file would fail to load. Fix the errors above, or pass live: true to confirm against the editor itself.')
+        }
+        return { text: clamp(lines.join('\n')) }
+      }
+
+      // The definitive check: the editor's own deserializer, with a snapshot taken
+      // first. A project that cannot be deserialized is exactly the case that leaves
+      // the editor mid-load, which is why the restore is attempted unconditionally.
+      const bytes = absolute.toLowerCase().endsWith('.json')
+        ? writeSb3(project, assets)
+        : await readFile(absolute)
+      const outcome = await service.use({ sessionId, mutating: true, force: args.force === true }, async (connection) => {
+        const snapshot = await exportSb3(connection)
+        let loaded = null
+        let failure = null
+        try {
+          loaded = await loadProjectBytes(connection, bytes)
+        } catch (error) {
+          failure = error?.message ?? String(error)
+        }
+        let restored = null
+        try {
+          const back = await loadProjectBytes(connection, snapshot)
+          restored = `${back.targets.length} target(s)`
+        } catch (error) {
+          restored = `FAILED: ${error?.message ?? String(error)}`
+        }
+        return { loaded, failure, restored }
+      })
+
+      lines.push('', 'live load check (editor deserializer):')
+      if (outcome.failure === null) {
+        lines.push(`  the editor OPENED it: ${outcome.loaded.targets.map((t) => `${t.name} (${t.blocks} blocks)`).join(', ')}`)
+      } else {
+        lines.push(`  the editor REJECTED it: ${outcome.failure}`)
+      }
+      lines.push(`  restored what was open: ${outcome.restored}`)
+      return { text: clamp(lines.join('\n')) }
     }
   })
 
@@ -456,7 +644,7 @@ export function apply (ctx, rowConfig = {}) {
     async run (args, exec, sessionId) {
       const absolute = resolveProjectPath(requireString(args.path, 'path'), exec)
       const bytes = await readFile(absolute)
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         const summary = absolute.toLowerCase().endsWith('.json')
           ? await loadProjectJson(connection, JSON.parse(bytes.toString('utf8')))
           : await loadProjectBytes(connection, bytes)
@@ -495,7 +683,7 @@ export function apply (ctx, rowConfig = {}) {
           spriteName: typeof args.sprite === 'string' && args.sprite.length > 0 ? args.sprite : undefined,
           spriteSvg: typeof args.svg === 'string' && args.svg.length > 0 ? args.svg : undefined
         })
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         // Load as an ARCHIVE, not as a JSON document. `loadProjectJson` hands the VM
         // a project whose costumes reference assets nothing has registered, and the
         // costume loader then waits forever for a load that can never happen — a
@@ -548,7 +736,7 @@ export function apply (ctx, rowConfig = {}) {
       const svg = typeof args.svg === 'string' && args.svg.trim().length > 0 ? args.svg : null
       if (svg !== null) assertLooksLikeSvg(svg)
 
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         if (action === 'duplicate') {
           const created = await duplicateSprite(connection, { target, name })
           return { text: `duplicated ${created.source} as ${created.name} (costumes: ${created.costumes.join(', ') || 'none'})\nsprites: ${created.sprites.join(', ')}` }
@@ -592,63 +780,124 @@ export function apply (ctx, rowConfig = {}) {
     name: 'gandi_costume',
     mutating: true,
     description: [
-      'Add a costume to a sprite — or a backdrop to the stage (target "stage") — from SVG markup you write yourself, or from base64 bytes for a bitmap.',
-      'Pass either `svg` text or `base64` plus `dataFormat`; the asset id is derived from the content.',
+      'Add, rename or delete a costume — or a backdrop, with target "stage".',
+      'To add: pass either `svg` text or `base64` plus `dataFormat`; the asset id is derived from the content.',
+      'Add several at once with `costumes: [{name, svg}, …]`, which is one call instead of one per costume.',
+      'To rename or delete: pass action and name (or index).',
       'When no rotation centre is given, the middle of the artwork is used, so the sprite rotates about its centre.',
-      'A backdrop usually wants no rotation centre at all; pass 0,0 for that.'
+      'For a 480x360 backdrop pass rotationCenterX 240, rotationCenterY 180 — a backdrop is positioned by its centre too,',
+      'so 0,0 puts it off in a corner and only a quarter of it shows.'
     ].join(' '),
     parameters: {
       type: 'object',
       properties: {
+        action: { type: 'string', enum: ['add', 'rename', 'delete'], description: 'What to do (default add).' },
         target: { type: 'string', description: 'Sprite name or id, or "stage" for a backdrop. Defaults to the editing target.' },
-        name: { type: 'string', description: 'Costume or backdrop name (default "costume").' },
+        name: { type: 'string', description: 'Costume or backdrop name (default "costume"). For rename/delete: which one.' },
+        newName: { type: 'string', description: 'For rename: the new name.' },
+        index: { type: 'number', description: 'For rename/delete: 0-based index, instead of name.' },
         svg: { type: 'string', description: 'SVG markup. Mutually exclusive with base64.' },
         base64: { type: 'string', description: 'Base64 bytes of the image. Requires dataFormat.' },
         dataFormat: { type: 'string', description: 'svg, png, jpg, bmp or gif (default svg).' },
         rotationCenterX: { type: 'number', description: 'Rotation centre x, in costume pixels.' },
-        rotationCenterY: { type: 'number', description: 'Rotation centre y, in costume pixels.' }
+        rotationCenterY: { type: 'number', description: 'Rotation centre y, in costume pixels.' },
+        costumes: {
+          type: 'array',
+          description: 'For add: several costumes in one call. Each entry takes the same fields as the top level (name, svg or base64+dataFormat, rotationCenterX/Y).',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              svg: { type: 'string' },
+              base64: { type: 'string' },
+              dataFormat: { type: 'string' },
+              rotationCenterX: { type: 'number' },
+              rotationCenterY: { type: 'number' }
+            },
+            additionalProperties: false
+          }
+        }
       },
       additionalProperties: false
     },
     async run (args, exec, sessionId) {
-      const hasSvg = typeof args.svg === 'string' && args.svg.trim().length > 0
-      const hasBase64 = typeof args.base64 === 'string' && args.base64.trim().length > 0
-      if (hasSvg === hasBase64) throw new Error('pass exactly one of `svg` or `base64`')
-
-      const dataFormat = (typeof args.dataFormat === 'string' && args.dataFormat.length > 0
-        ? args.dataFormat
-        : (hasSvg ? 'svg' : 'png')).toLowerCase()
-      const name = typeof args.name === 'string' && args.name.length > 0 ? args.name : `costume`
-
-      let base64 = args.base64
-      let centre = null
-      if (hasSvg) {
-        assertLooksLikeSvg(args.svg)
-        centre = defaultRotationCenter(args.svg)
-        base64 = Buffer.from(args.svg, 'utf8').toString('base64')
+      const action = args.action === undefined ? 'add' : requireString(args.action, 'action')
+      if (!['add', 'rename', 'delete'].includes(action)) {
+        throw new Error(`unknown action "${action}"; use add, rename or delete`)
       }
-      const rotationCenterX = Number.isFinite(args.rotationCenterX) ? Number(args.rotationCenterX) : (centre?.x ?? 0)
-      const rotationCenterY = Number.isFinite(args.rotationCenterY) ? Number(args.rotationCenterY) : (centre?.y ?? 0)
+      const target = typeof args.target === 'string' && args.target.length > 0 ? args.target : undefined
 
-      return service.use({ sessionId, mutating: true }, async (connection) => {
-        const installed = await addCostume(connection, {
-          target: typeof args.target === 'string' && args.target.length > 0 ? args.target : undefined,
+      if (action !== 'add') {
+        const name = typeof args.name === 'string' && args.name.length > 0 ? args.name : undefined
+        if (name === undefined && !Number.isInteger(args.index)) throw new Error(`${action} needs a name or an index`)
+        if (action === 'rename') requireString(args.newName, 'newName')
+        return service.use(writeAccess(args, sessionId), async (connection) => {
+          const result = await editCostume(connection, {
+            target,
+            action,
+            name,
+            index: Number.isInteger(args.index) ? args.index : undefined,
+            newName: typeof args.newName === 'string' ? args.newName : undefined
+          })
+          const where = result.isStage ? 'the stage' : result.target
+          return {
+            text: action === 'rename'
+              ? `renamed ${result.isStage ? 'backdrop' : 'costume'} "${result.requested}" to "${result.name}" on ${where}` +
+                (result.renamed ? '' : ' (the name was already taken, so the editor kept a unique variant)') +
+                `\n${result.isStage ? 'backdrops' : 'costumes'} now: ${result.costumes.join(', ')}`
+              : `deleted ${result.isStage ? 'backdrop' : 'costume'} "${result.name}" from ${where}` +
+                `\n${result.isStage ? 'backdrops' : 'costumes'} now: ${result.costumes.join(', ')}`
+          }
+        })
+      }
+
+      // Everything from here on adds costumes. A batch is a batch: the tool does the
+      // loop, so a 55-costume art pass is one call and one lease acquisition.
+      const entries = Array.isArray(args.costumes) && args.costumes.length > 0
+        ? args.costumes.map((entry) => ({ ...args, ...entry, costumes: undefined, action: undefined }))
+        : [args]
+      if (entries.length > 1 && (typeof args.svg === 'string' || typeof args.base64 === 'string')) {
+        throw new Error('pass either a single costume (svg/base64) or `costumes: [...]`, not both')
+      }
+
+      const prepared = entries.map((entry, index) => {
+        const label = entries.length > 1 ? `costumes[${index}]` : 'costume'
+        const hasSvg = typeof entry.svg === 'string' && entry.svg.trim().length > 0
+        const hasBase64 = typeof entry.base64 === 'string' && entry.base64.trim().length > 0
+        if (hasSvg === hasBase64) throw new Error(`${label}: pass exactly one of \`svg\` or \`base64\``)
+        const dataFormat = (typeof entry.dataFormat === 'string' && entry.dataFormat.length > 0
+          ? entry.dataFormat
+          : (hasSvg ? 'svg' : 'png')).toLowerCase()
+        const name = typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : 'costume'
+        let base64 = entry.base64
+        let centre = null
+        if (hasSvg) {
+          assertLooksLikeSvg(entry.svg)
+          centre = defaultRotationCenter(entry.svg)
+          base64 = Buffer.from(entry.svg, 'utf8').toString('base64')
+        }
+        return {
           name,
           dataFormat,
           base64,
-          rotationCenterX,
-          rotationCenterY
-        })
-        const where = installed.isStage ? 'the stage' : installed.target
-        const centreNote = installed.isStage
-          ? 'no rotation centre needed for a backdrop'
-          : `rotation centre ${rotationCenterX}, ${rotationCenterY}`
-        return {
-          text: [
-            `added ${installed.kind} "${installed.costume}" to ${where} (${installed.bytes} bytes, ${centreNote})`,
-            `${installed.kind}s now: ${installed.costumes.join(', ')}`
-          ].join('\n')
+          rotationCenterX: Number.isFinite(entry.rotationCenterX) ? Number(entry.rotationCenterX) : (centre?.x ?? 0),
+          rotationCenterY: Number.isFinite(entry.rotationCenterY) ? Number(entry.rotationCenterY) : (centre?.y ?? 0)
         }
+      })
+
+      return service.use(writeAccess(args, sessionId), async (connection) => {
+        const installed = []
+        for (const request of prepared) {
+          installed.push(await addCostume(connection, { target, ...request }))
+        }
+        const last = installed[installed.length - 1]
+        const where = last.isStage ? 'the stage' : last.target
+        const lines = installed.length === 1
+          ? [`added ${last.kind} "${last.costume}" to ${where} (${last.bytes} bytes, ` +
+             (last.isStage ? 'no rotation centre needed for a backdrop' : `rotation centre ${prepared[0].rotationCenterX}, ${prepared[0].rotationCenterY}`) + ')']
+          : [`added ${installed.length} ${last.kind}s to ${where}: ${installed.map((entry) => `${entry.costume} (${entry.bytes} bytes)`).join(', ')}`]
+        lines.push(`${last.kind}s now: ${last.costumes.join(', ')}`)
+        return { text: lines.join('\n') }
       })
     }
   })
@@ -689,7 +938,7 @@ export function apply (ctx, rowConfig = {}) {
         throw new Error('setting a list needs `value` as a comma-separated string')
       }
 
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         const result = await editVariable(connection, {
           action,
           name,
@@ -721,15 +970,20 @@ export function apply (ctx, rowConfig = {}) {
     name: 'gandi_sound',
     mutating: true,
     description: [
-      'Add a sound to a sprite.',
-      'By default it SYNTHESIZES one from a pitch, a duration and a waveform — give `sweepTo` for a rise or a fall, which is what most game sounds are.',
-      'Pass base64 instead to upload audio bytes you already have.'
+      'Add, rename or delete a sound on a sprite.',
+      'To add: by default it SYNTHESIZES one from a pitch, a duration and a waveform — give `sweepTo` for a rise or a fall, which is what most game sounds are.',
+      'Pass base64 instead to upload audio bytes you already have.',
+      'action "rename" also rewrites every sound_play block that named it; action "delete" does not, so a script that',
+      'played the removed sound keeps a name that resolves to nothing.'
     ].join(' '),
     parameters: {
       type: 'object',
       properties: {
+        action: { type: 'string', enum: ['add', 'rename', 'delete'], description: 'What to do (default add).' },
         target: { type: 'string', description: 'Sprite name or id. Defaults to the editing target.' },
-        name: { type: 'string', description: 'Sound name (default "sound").' },
+        name: { type: 'string', description: 'Sound name (default "sound"). For rename/delete: which one.' },
+        newName: { type: 'string', description: 'For rename: the new name.' },
+        index: { type: 'number', description: 'For rename/delete: 0-based index, instead of name.' },
         frequency: { type: 'number', description: 'Starting pitch in Hz (default 440).' },
         sweepTo: { type: 'number', description: 'Glide to this frequency by the end.' },
         seconds: { type: 'number', description: 'Length in seconds (default 0.25).' },
@@ -741,6 +995,35 @@ export function apply (ctx, rowConfig = {}) {
       additionalProperties: false
     },
     async run (args, exec, sessionId) {
+      const action = args.action === undefined ? 'add' : requireString(args.action, 'action')
+      if (!['add', 'rename', 'delete'].includes(action)) {
+        throw new Error(`unknown action "${action}"; use add, rename or delete`)
+      }
+      const target = typeof args.target === 'string' && args.target.length > 0 ? args.target : undefined
+
+      if (action !== 'add') {
+        const name = typeof args.name === 'string' && args.name.length > 0 ? args.name : undefined
+        if (name === undefined && !Number.isInteger(args.index)) throw new Error(`${action} needs a name or an index`)
+        if (action === 'rename') requireString(args.newName, 'newName')
+        return service.use(writeAccess(args, sessionId), async (connection) => {
+          const result = await editSound(connection, {
+            target,
+            action,
+            name,
+            index: Number.isInteger(args.index) ? args.index : undefined,
+            newName: typeof args.newName === 'string' ? args.newName : undefined
+          })
+          const keptName = result.name === result.requested
+            ? ''
+            : ` (asked for "${result.requested}"; the name was taken, so the editor kept "${result.name}")`
+          return {
+            text: action === 'rename'
+              ? `renamed sound on ${result.target}: "${result.name}"${keptName}\nsounds now: ${result.sounds.join(', ') || '(none)'}`
+              : `deleted sound "${result.name}" from ${result.target}\nsounds now: ${result.sounds.join(', ') || '(none)'}`
+          }
+        })
+      }
+
       const hasBase64 = typeof args.base64 === 'string' && args.base64.trim().length > 0
       const name = typeof args.name === 'string' && args.name.length > 0 ? args.name : 'sound'
 
@@ -771,7 +1054,7 @@ export function apply (ctx, rowConfig = {}) {
         described = `synthesized ${samples.length} frames at ${rate} Hz`
       }
 
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         const installed = await addSound(connection, {
           target: typeof args.target === 'string' && args.target.length > 0 ? args.target : undefined,
           name,
@@ -819,7 +1102,7 @@ export function apply (ctx, rowConfig = {}) {
       if (Object.values(request).every((value) => value === undefined)) {
         throw new Error('pass at least one of x, y, direction, size or visible')
       }
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         const state = await setTargetState(connection, request)
         return {
           text: `${state.target}: x=${state.x} y=${state.y} direction=${state.direction} size=${state.size}% visible=${state.visible}`
@@ -857,7 +1140,7 @@ export function apply (ctx, rowConfig = {}) {
         throw new Error(`"${args.key}" is not a key this can press; try ${knownKeyNames().slice(0, 12).join(', ')}, or a single character`)
       }
 
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         const notes = []
         if (hasKey) {
           const isDown = args.isDown !== false
@@ -885,8 +1168,8 @@ export function apply (ctx, rowConfig = {}) {
     mutating: true,
     description: 'Stop every running script (the red stop sign), without changing the project.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
-    async run (_args, exec, sessionId) {
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+    async run (args, exec, sessionId) {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         await stopAll(connection)
         const state = await observe(connection, { includeClones: false })
         return { text: `stopped all scripts; ${state.threads} thread(s) left` }
@@ -1051,14 +1334,19 @@ export function apply (ctx, rowConfig = {}) {
       'Add or replace one sprite\'s scripts from scratch-blocks XML.',
       'The dialect is exactly what gandi_inspect prints, so read-modify-write round-trips.',
       'The project is edited in place: everything else, including editor state, is preserved.',
-      'Pass dryRun to compile and see warnings without touching the editor.'
+      'mode "replace" (default) swaps every script of the sprite; "replaceScript" swaps exactly one of them (1-based',
+      'position in the script list, or its block id); "append" adds alongside what is there.',
+      'XML that would produce a project the editor cannot open is REFUSED, not written: a dropdown shadow that is not',
+      'the one the block expects, an unknown shadow type, a custom-block call whose arguments cannot be resolved.',
+      'Pass dryRun to compile and check without touching anything — with `path` it also checks the result after applying.'
     ].join(' '),
     parameters: {
       type: 'object',
       properties: {
         xml: { type: 'string', description: 'scratch-blocks XML: an <xml> wrapper, or a bare <block>.' },
         target: { type: 'string', description: 'Sprite name or id. Defaults to the editing target (or the first sprite, offline).' },
-        mode: { type: 'string', enum: ['replace', 'append'], description: 'replace (default) removes that sprite\'s existing scripts first.' },
+        mode: { type: 'string', enum: ['replace', 'append', 'replaceScript'], description: 'replace (default) removes that sprite\'s existing scripts first; replaceScript removes just one.' },
+        script: { type: 'string', description: 'With mode replaceScript: which script to swap — its 1-based position, or its top-level block id.' },
         path: { type: 'string', description: 'Edit this .sb3 on disk instead of the open editor. No Gandi needed.' },
         outPath: { type: 'string', description: 'With path: write the result here instead of editing the file in place.' },
         scope: { type: 'string', enum: ['global', 'local'], description: 'With path: where new variables go (default global, on the stage).' },
@@ -1069,34 +1357,91 @@ export function apply (ctx, rowConfig = {}) {
     },
     async run (args, exec, sessionId) {
       const xml = requireString(args.xml, 'xml')
-      const mode = args.mode === 'append' ? 'append' : 'replace'
+      const mode = args.mode === 'append' || args.mode === 'replaceScript' ? args.mode : 'replace'
       const target = typeof args.target === 'string' && args.target.length > 0 ? args.target : undefined
-      const fragment = compileScripts(xml)
+      if (mode === 'replaceScript' && args.script === undefined) {
+        throw new Error('mode "replaceScript" needs `script`: the 1-based position of the script in that sprite, or its top-level block id. ' +
+          'gandi_inspect prints the scripts of a sprite in that order.')
+      }
+
+      // A call to a custom block that already exists in the target can only be compiled
+      // if the target's own definitions are known: the argument ids live there and
+      // nowhere else. Reading them costs one cheap call, and only when the XML contains
+      // a call at all — otherwise the compiler is handed nothing and behaves as before.
+      const needsProcedures = mode !== 'replace' && xml.includes('procedures_call')
+      const offline = typeof args.path === 'string' && args.path.length > 0
+        ? await (async () => {
+            const absolute = resolveProjectPath(args.path, exec)
+            const read = await readProjectFile(absolute)
+            return { absolute, ...read }
+          })()
+        : null
+
+      let procedures
+      if (needsProcedures) {
+        if (offline !== null) {
+          try {
+            procedures = proceduresFromBlocks(findProjectTarget(offline.project, target).blocks)
+          } catch {
+            // A target that does not exist yet is the offline layer's error to raise,
+            // with a message that lists what the project does have.
+            procedures = undefined
+          }
+        } else {
+          const declarations = await service.use({ sessionId, mutating: false }, (connection) =>
+            getProcedureDeclarations(connection, { target }))
+          procedures = proceduresFromBlocks(declarations.blocks)
+        }
+      }
+
+      const fragment = compileScripts(xml, procedures === undefined ? {} : { procedures })
       const warnings = fragment.warnings.length === 0 ? '  (none)' : fragment.warnings.map((w) => `  ${w}`).join('\n')
 
       // The offline path never needs the engine-form conversion, because a project
       // document already stores blocks in the wire form the compiler emits.
       if (args.dryRun === true) {
         const engine = fragmentToEngine(fragment)
-        return {
-          text: `dry run: ${Object.keys(fragment.blocks).length} block(s) compiled into ${engine.blocks.length} engine block(s), ${fragment.variables.length} variable declaration(s).\nwarnings:\n${warnings}`
+        const notes = [
+          `dry run: ${Object.keys(fragment.blocks).length} block(s) compiled into ${engine.blocks.length} engine block(s), ` +
+          `${fragment.variables.length} variable declaration(s).`,
+          `checks passed: every shadow is a primitive or the dropdown its input takes; every mutation carries the fields the editor reads` +
+          (procedures === undefined ? '' : `; ${procedures.length} custom block(s) of the target were available to resolve calls`),
+          `warnings:\n${warnings}`
+        ]
+        // With a file in hand the result can be checked the way the editor will read it:
+        // apply the fragment to a COPY and run the load check over the copy.
+        if (offline !== null) {
+          const copy = structuredClone(offline.project)
+          const applied = applyFragmentToProject(copy, {
+            target,
+            fragment,
+            mode,
+            script: args.script === undefined ? undefined : (typeof args.script === 'number' ? args.script : String(args.script)),
+            scope: args.scope === 'local' ? 'local' : 'global'
+          })
+          const report = verifyProject(copy, { assets: offline.assets })
+          notes.push('', formatReport(report, { heading: `load check of ${applied.target} after applying (nothing was written)` }))
+        } else {
+          notes.push('')
+          notes.push('(pass `path` as well to have dryRun check the whole project the way the editor will read it)')
         }
+        return { text: clamp(notes.join('\n')) }
       }
       if (fragment.warnings.length > 0) {
         throw new Error(`refusing to apply XML with problems:\n${warnings}\nFix them, or call again with dryRun: true to inspect first.`)
       }
 
       // Offline: splice into the project document and write the archive back.
-      if (typeof args.path === 'string' && args.path.length > 0) {
-        const absolute = resolveProjectPath(args.path, exec)
+      if (offline !== null) {
+        const { absolute, project, assets, warnings: containerWarnings } = offline
         const destination = typeof args.outPath === 'string' && args.outPath.length > 0
           ? resolveProjectPath(args.outPath, exec)
           : absolute
-        const { project, assets, warnings: containerWarnings } = await readProjectFile(absolute)
         const result = applyFragmentToProject(project, {
           target,
           fragment,
           mode,
+          script: args.script === undefined ? undefined : (typeof args.script === 'number' ? args.script : String(args.script)),
           scope: args.scope === 'local' ? 'local' : 'global'
         })
         // The destination extension decides the format: writing an archive into a
@@ -1106,6 +1451,10 @@ export function apply (ctx, rowConfig = {}) {
           ? Buffer.from(`${JSON.stringify(project, null, 2)}\n`, 'utf8')
           : writeSb3(project, assets)
         await writeFile(destination, bytes)
+        // The written file is checked before it is announced as done. A splice can only
+        // break things the fragment itself brought (dangling references, missing
+        // assets), and saying so now is cheaper than finding out at load time.
+        const report = verifyProject(project, { assets })
         return {
           text: [
             `edited ${absolute}${destination === absolute ? ' in place' : ` -> ${destination}`} (${asJson ? 'project.json' : 'sb3 archive'})`,
@@ -1114,19 +1463,23 @@ export function apply (ctx, rowConfig = {}) {
             result.declaredVariables.length > 0 ? `declared variables: ${result.declaredVariables.join(', ')}` : 'no new variables',
             `comments: +${result.createdComments} / -${result.removedComments}`,
             `wrote ${bytes.length} bytes`,
-            ...(containerWarnings.length > 0 ? [`container notes:\n${containerWarnings.map((w) => `  ${w}`).join('\n')}`] : [])
+            ...(containerWarnings.length > 0 ? [`container notes:\n${containerWarnings.map((w) => `  ${w}`).join('\n')}`] : []),
+            ...(report.errors.length > 0 || report.warnings.length > 0
+              ? ['', formatReport(report, { heading: 'load check after applying' })]
+              : [`load check: clean (${report.stats.blocks} block(s), no dangling references)`])
           ].join('\n')
         }
       }
 
       const engine = fragmentToEngine(fragment)
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         const applied = await applyFragment(connection, {
           target,
           blocks: engine.blocks,
           variables: fragment.variables,
           comments: engine.comments,
-          mode
+          mode,
+          script: args.script === undefined ? undefined : (typeof args.script === 'number' ? args.script : String(args.script))
         })
         return {
           text: [
@@ -1142,6 +1495,102 @@ export function apply (ctx, rowConfig = {}) {
     }
   })
 
+  // ── merge ─────────────────────────────────────────────────────────────────
+
+  registerTool({
+    name: 'gandi_merge',
+    mutating: true,
+    description: [
+      'Merge another project\'s sprites into this one — the multi-agent finishing move.',
+      'Take `from` (a .sb3 another writer produced), and merge the named sprites into the open editor or into a file',
+      'given by `path`. Each merge moves the whole sprite: its scripts, its own variables and lists, and its costumes',
+      'and sounds WITH the asset bytes. That is the point — replacing scripts without the variables leaves every local',
+      'reference dangling (a delivery did exactly that with a hand-written script and got 374 of them), and it still',
+      'opened, so nothing looked wrong.',
+      'New globals from the source are UNIONED into the stage by id; a same-id-different-name collision is reported',
+      'rather than silently resolved. Sprites the destination does not have are added whole.'
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'The .sb3 to take sprites from.' },
+        path: { type: 'string', description: 'Merge into this .sb3 on disk instead of the open editor.' },
+        outPath: { type: 'string', description: 'With path: write the result here instead of editing the file in place.' },
+        targets: { type: 'array', items: { type: 'string' }, description: 'Sprite names to take (default: every sprite in the source).' },
+        mode: { type: 'string', enum: ['replace', 'scripts'], description: 'replace (default) takes scripts, variables, lists, costumes and sounds; scripts takes only the scripts and comments.' },
+        dryRun: { type: 'boolean', description: 'Report what would be merged without writing anything.' }
+      },
+      required: ['from'],
+      additionalProperties: false
+    },
+    async run (args, exec, sessionId) {
+      const fromPath = resolveProjectPath(requireString(args.from, 'from'), exec)
+      const source = await readProjectFile(fromPath)
+      const mode = args.mode === 'scripts' ? 'scripts' : 'replace'
+      const targets = Array.isArray(args.targets) ? args.targets.filter((name) => typeof name === 'string' && name.length > 0) : undefined
+
+      /**
+       * Merge into one destination document.
+       * @param {any} project destination project (mutated)
+       * @param {Map<string, any>} assets destination archive contents (mutated)
+       * @returns {string} the report
+       */
+      const runMerge = (project, assets) => {
+        const result = mergeProjects(project, source.project, {
+          targets,
+          mode,
+          assets,
+          sourceAssets: source.assets
+        })
+        const report = verifyProject(project, { assets })
+        const text = [formatMerge(result, fromPath)]
+        if (report.errors.length > 0 || report.warnings.length > 0) {
+          text.push('', formatReport(report, { heading: 'load check after merging' }))
+        } else {
+          text.push(`load check: clean (${report.stats.sprites} sprite(s), ${report.stats.blocks} block(s), ${report.stats.assets} asset(s))`)
+        }
+        return text.join('\n')
+      }
+
+      // Offline: read the destination file, merge, write it back.
+      if (typeof args.path === 'string' && args.path.length > 0) {
+        const absolute = resolveProjectPath(args.path, exec)
+        const destination = typeof args.outPath === 'string' && args.outPath.length > 0
+          ? resolveProjectPath(args.outPath, exec)
+          : absolute
+        const to = await readProjectFile(absolute)
+        if (args.dryRun === true) {
+          const copy = structuredClone(to.project)
+          const text = runMerge(copy, to.assets)
+          return { text: `dry run — nothing was written.\n${text}` }
+        }
+        const text = runMerge(to.project, to.assets)
+        const asJson = destination.toLowerCase().endsWith('.json')
+        const bytes = asJson
+          ? Buffer.from(`${JSON.stringify(to.project, null, 2)}\n`, 'utf8')
+          : writeSb3(to.project, to.assets)
+        await writeFile(destination, bytes)
+        return { text: `${text}\nwrote ${bytes.length} bytes to ${destination}${asJson ? ' (project.json)' : ''}` }
+      }
+
+      // Live: export the open project (assets included), merge, and load it back. Going
+      // through archive bytes is the only way assets survive — see gandi_new.
+      return service.use(writeAccess(args, sessionId), async (connection) => {
+        const current = readSb3(await exportSb3(connection))
+        if (args.dryRun === true) {
+          const copy = structuredClone(current.project)
+          return { text: `dry run — the open project was not touched.\n${runMerge(copy, current.assets)}` }
+        }
+        const text = runMerge(current.project, current.assets)
+        const bytes = writeSb3(current.project, current.assets)
+        const summary = await loadProjectBytes(connection, bytes)
+        return {
+          text: `${text}\nreloaded the editor: ${summary.targets.length} target(s), ${bytes.length} bytes`
+        }
+      })
+    }
+  })
+
   // ── run ───────────────────────────────────────────────────────────────────
 
   registerTool({
@@ -1150,7 +1599,10 @@ export function apply (ctx, rowConfig = {}) {
     schema: IMAGE_OUTPUT,
     description: [
       'Press the green flag, advance the project by N seconds, then report what happened.',
-      'Timers are paced against the real clock, so "wait 1 seconds" blocks behave as they do for a user.',
+      'The run is paced by the bridge with the editor\'s own stepping loop paused, so the project advances at exactly',
+      '1000/currentStepTime frames per second (30 for a stock Scratch runtime) no matter what the window is doing —',
+      'the same run twice gives the same result. The green flag stops every thread and resets the project timer, but it',
+      'does NOT reset variables: report entries that changed during the run are printed so a value leaking across runs is visible.',
       'Returns the resulting runtime state and, by default, a stage image so you can see the outcome.'
     ].join(' '),
     parameters: {
@@ -1160,6 +1612,14 @@ export function apply (ctx, rowConfig = {}) {
         stopAfter: { type: 'boolean', description: 'Stop all scripts afterwards (default true).' },
         screenshot: { type: 'boolean', description: 'Include a stage image (defaults to the plugin config, normally true).' },
         includeClones: { type: 'boolean', description: 'Include clones in the reported state (default false).' },
+        resetVariables: {
+          type: 'boolean',
+          description: [
+            'Before the flag, set every variable to 0 and empty every list (default false).',
+            'This is what a Scratch author does by hand in an init script, not a restore of the values the project was saved with —',
+            'those are overwritten by the first script that writes to them. Broadcast messages are left alone.'
+          ].join(' ')
+        },
         input: {
           type: 'array',
           description: [
@@ -1219,26 +1679,73 @@ export function apply (ctx, rowConfig = {}) {
         }
       }
 
-      return service.use({ sessionId, mutating: true }, async (connection) => {
+      return service.use(writeAccess(args, sessionId), async (connection) => {
         // Position the mouse before the flag: it has no edge semantics, so unlike the
         // keyboard it survives greenFlag (postMouse does not touch the key cache).
         for (const event of mouseEvents) await postMouse(connection, { x: event.x, y: event.y, isDown: event.click, click: event.click })
+        if (args.resetVariables === true) await resetVariables(connection)
+
+        // State before the run, so the report can name what the run CHANGED. This is
+        // the difference between "the counter says 178" and "the counter went 0 -> 178",
+        // and a value that starts non-zero is the signature of state leaking across runs.
+        const before = await observe(connection, { includeClones: false })
+        const beforeValues = new Map()
+        for (const target of before.targets) {
+          for (const variable of target.variables) beforeValues.set(`${target.name}.${variable.name}`, variable.value)
+        }
+
         const run = await runSteps(connection, { seconds, stopAfter, events: keyEvents })
         const state = await observe(connection, { includeClones: args.includeClones === true })
         const lines = [
-          `ran ${run.steps} frames (~${seconds}s): ${run.startedThreads} thread(s) started, ${run.threadsLeft} still running${run.stopped === true ? ', stopped afterwards' : ''}`
+          `ran ${run.steps} frames (~${seconds}s at ${Math.round(1000 / run.stepMs)} fps): ${run.startedThreads} thread(s) started, ` +
+          `${run.threadsLeft} still running${run.stopped === true ? ', stopped afterwards' : ''}`
         ]
+        if (args.resetVariables === true) lines.push('variables were reset to 0 / empty before the flag')
         if (run.eventsFired > 0) lines.push(`input applied during the run: ${run.eventsFired} key event(s)`)
+
+        // Page errors during the run. This runtime reports its worst failures as a
+        // rejected promise carrying a bare string (a stale glow id, most famously), so
+        // without this the symptom is "nothing happened" and the cause is invisible.
+        if (Array.isArray(run.errors) && run.errors.length > 0) {
+          lines.push(`page errors during the run (${run.errors.length}):`)
+          for (const error of run.errors.slice(0, 5)) lines.push(`  - ${error}`)
+        }
+
         for (const target of state.targets) {
+          const changed = target.variables
+            .map((v) => ({ ...v, was: beforeValues.get(`${target.name}.${v.name}`) }))
+            .filter((v) => beforeValues.has(`${target.name}.${v.name}`) && !sameValue(v.was, v.value))
           const vars = target.variables.length > 0
             ? ` vars: ${target.variables.map((v) => `${v.name}=${formatValue(v.value)}`).join(', ')}`
             : ''
           lines.push(`  ${target.name}${target.isStage ? ' (stage)' : ''}: x=${target.x} y=${target.y} dir=${target.direction} costume=${target.costume ?? 'none'}${vars}`)
+          if (changed.length > 0) {
+            lines.push(`    changed during the run: ${changed.map((v) => `${v.name} ${formatValue(v.was)} -> ${formatValue(v.value)}`).join(', ')}`)
+          }
         }
+
         const text = clamp(lines.join('\n'))
-        if (!wantShot) return { text }
+        const summary = lines[0]
+        if (!wantShot) {
+          service.noteRun(summary)
+          return { text }
+        }
         const shot = await screenshot(connection)
-        return withStageImage(shot, text, exec)
+        const bytes = Buffer.from(shot.dataUri.replace(/^data:image\/png;base64,/, ''), 'base64')
+        const hash = createHash('sha256').update(bytes).digest('hex')
+        // The image is compared with the previous one from THIS process. A stage image
+        // that is byte-identical across two runs with different states is the symptom a
+        // delivery spent hours on — it looks like "the stage never rendered", and the
+        // honest thing to do is to say so in the output rather than let the reader
+        // discover it. The comparison is per hash, so it costs nothing to carry.
+        const repeated = hash === lastStageHash
+        lastStageHash = hash
+        service.noteRun(`${summary}${repeated ? ' [image identical to the previous capture]' : ''}`)
+        const notice = repeated
+          ? '\nNOTE: this stage image is byte-identical to the previous one. If the state above changed, do not trust the picture — ' +
+            'call gandi_screenshot {savePath} and read the PNG instead.'
+          : ''
+        return withStageImage(shot, `${text}${notice}`, exec)
       })
     }
   })

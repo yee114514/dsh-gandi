@@ -14,6 +14,7 @@
  */
 
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { deflateSync } from 'node:zlib'
@@ -21,7 +22,7 @@ import { deflateSync } from 'node:zlib'
 import { apply } from '../src/index.mjs'
 import { listTargets, CdpConnection } from '../src/bridge/cdp.mjs'
 import { getProjectJson, exportSb3, loadProjectBytes } from '../src/bridge/ops.mjs'
-import { readSb3 } from '../src/scratch/sb3.mjs'
+import { readSb3, writeSb3 } from '../src/scratch/sb3.mjs'
 import { crc32 } from '../src/scratch/zip.mjs'
 
 /**
@@ -110,11 +111,20 @@ const harness = (config) => {
     }
   }
   apply(ctx, config)
-  const call = async (name, args = {}) => {
+  /**
+   * Call a tool as a named session. The session id is what the lease is keyed on, so
+   * two ids are how a single process can play two agents and prove that the second one
+   * is actually blocked — and then unblocked by `force`.
+   *
+   * @param {string} name tool name
+   * @param {Record<string, unknown>} [args] tool arguments
+   * @param {string} [sessionId] which session is asking
+   */
+  const call = async (name, args = {}, sessionId = 'e2e-session') => {
     const definition = tools.get(name)
     if (definition === undefined) throw new Error(`no such tool: ${name}`)
     const value = await definition.execute(args, {
-      agent: { id: 'e2e-agent', session: { header: { id: 'e2e-session', cwd: root } } }
+      agent: { id: `e2e-agent-${sessionId}`, session: { header: { id: sessionId, cwd: root } } }
     })
     const blocks = definition.output.render(args, value)
     return { value, blocks, text: blocks[0].text, image: blocks.find((b) => b.type === 'image') }
@@ -453,6 +463,32 @@ const main = async () => {
   check('inspect sees the backdrop', new RegExp(`costumes: .*${NIGHT}`).test(afterArtwork.text), afterArtwork.text)
   check('inspect sees the bitmap costume', new RegExp(`costumes: .*${DOT}`).test(afterArtwork.text), afterArtwork.text)
 
+  // ── a batch of costumes, then tidying up after it ────────────────────────
+  // Art passes come in batches: 55 costumes used to be 55 calls and 55 lease
+  // acquisitions. And a costume that should never have been drawn used to be
+  // permanent, because there was no way to remove one.
+  const BATCH_A = `e2e-batch-a-${SUFFIX}`
+  const BATCH_B = `e2e-batch-b-${SUFFIX}`
+  const square = (colour) => '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30">' +
+    `<rect width="30" height="30" fill="${colour}"/></svg>`
+  const batched = await call('gandi_costume', {
+    target: subject,
+    costumes: [{ name: BATCH_A, svg: square('#ff0000') }, { name: BATCH_B, svg: square('#0000ff') }]
+  })
+  console.log('--- costume batch ---\n' + batched.text + '\n')
+  check('a batch adds every costume in one call', batched.text.includes('added 2 costumes'), batched.text)
+  check('the batch lists both', new RegExp(`${BATCH_A}.*${BATCH_B}`).test(batched.text), batched.text)
+
+  const RENAMED = `e2e-batch-renamed-${SUFFIX}`
+  const renamedCostume = await call('gandi_costume', { target: subject, action: 'rename', name: BATCH_A, newName: RENAMED })
+  console.log('--- costume rename ---\n' + renamedCostume.text + '\n')
+  check('a costume can be renamed', new RegExp(`${RENAMED}`).test(renamedCostume.text), renamedCostume.text)
+
+  const deletedCostume = await call('gandi_costume', { target: subject, action: 'delete', name: BATCH_B })
+  check('a costume can be deleted',
+    deletedCostume.text.includes(`deleted costume "${BATCH_B}"`) && !new RegExp(`${BATCH_B}[,\\n]`).test(deletedCostume.text),
+    deletedCostume.text)
+
   // ── variables and lists ─────────────────────────────────────────────────
   const VAR2 = `e2e_created_${SUFFIX}`
   const LIST2 = `e2e_list_${SUFFIX}`
@@ -533,6 +569,41 @@ const main = async () => {
   check('inspect reports the argument reporter', /argument_reporter_string_number/.test(readBack.text), readBack.text.slice(0, 400))
   check('inspect reports the comment', /<comment id="e2eNote"[^>]*>calls a custom block with 77<\/comment>/.test(readBack.text), readBack.text.slice(0, 700))
 
+  // ── calling that custom block from a LATER fragment ──────────────────────
+  // The append case, and the one the authoring guide used to get wrong: the definition
+  // is not in this XML, so the compiler has to read the argument ids out of the target
+  // itself. Written the other way (a hand-written `argumentids`) the call passes
+  // nothing and the sprite does not move — silently.
+  //
+  // The call hangs off a KEY hat, and the contribution is the DIFFERENCE between the two
+  // runs: the flag hat from the section above is still there and still runs.
+  await call('gandi_apply', {
+    mode: 'append',
+    xml: `<xml>
+      <block type="event_whenkeypressed" id="e2eCrossCallHat" x="40" y="900">
+        <field name="KEY_OPTION">x</field>
+        <next>
+          <block type="procedures_call" id="e2eCrossCall">
+            <mutation proccode="nudge %n"></mutation>
+            <value name="amount"><shadow type="math_number"><field name="NUM">13</field></shadow></value>
+          </block>
+        </next>
+      </block>
+    </xml>`
+  })
+  await call('gandi_place', { x: 0, y: 0 })
+  const flagOnly = await call('gandi_run', { seconds: 0.3, screenshot: false })
+  await call('gandi_place', { x: 0, y: 0 })
+  const withCrossCall = await call('gandi_run', {
+    seconds: 0.3,
+    screenshot: false,
+    input: [{ atSeconds: 0, key: 'x', isDown: true }]
+  })
+  await call('gandi_input', { key: 'x', isDown: false })
+  const crossDelta = spriteX(withCrossCall.text) - spriteX(flagOnly.text)
+  check('a call written in a later fragment resolves against the target definition',
+    crossDelta === 13, `moved ${crossDelta} (flag-only x=${spriteX(flagOnly.text)}, with the key hat x=${spriteX(withCrossCall.text)})`)
+
   // A comment is target state and the runtime calls toXML() on every one of them, so
   // a plain object there would break the editor's workspace sync on the next emit.
   // Push another edit through and confirm the editor is still healthy.
@@ -566,6 +637,107 @@ const main = async () => {
     afterReplace !== null && afterReplace.scripts === 1 && afterReplace.blocks === 1,
     JSON.stringify(afterReplace))
 
+  // ── one run is exactly one run ───────────────────────────────────────────
+  // The whole point of pausing the editor's own stepping loop. A delivery measured its
+  // `forever` counter at ~1.85x the frames gandi_run reported, concluded the runtime
+  // steps at 60 fps, and tuned every physics constant for double speed.
+  //
+  // The counter has to yield once per frame to be a frame counter at all: scratch-vm
+  // gives a thread 75% of currentStepTime of WORK per frame, so a forever loop whose
+  // body only changes a variable runs hundreds of thousands of times inside a single
+  // frame (measured: 663162 in one second). "wait 0 seconds" yields exactly once, so the
+  // count is the frame count — ~30 for one second, ~60 if a loop is double-stepping.
+  const TICK = `e2e_tick_${SUFFIX}`
+  const TICK_ID = `e2eTick${SUFFIX}`
+  await call('gandi_apply', {
+    xml: `<xml>
+      <variables><variable id="${TICK_ID}" type="">${TICK}</variable></variables>
+      <block type="event_whenflagclicked" id="e2eTickHat" x="0" y="0">
+        <next>
+          <block type="control_forever">
+            <statement name="SUBSTACK">
+              <block type="control_wait">
+                <value name="DURATION"><shadow type="math_positive_number"><field name="NUM">0</field></shadow></value>
+                <next>
+                  <block type="data_changevariableby">
+                    <field name="VARIABLE" id="${TICK_ID}" variabletype="">${TICK}</field>
+                    <value name="VALUE"><shadow type="math_number"><field name="NUM">1</field></shadow></value>
+                  </block>
+                </next>
+              </block>
+            </statement>
+          </block>
+        </next>
+      </block>
+    </xml>`
+  })
+  const ticking = await call('gandi_run', { seconds: 1, screenshot: false })
+  console.log('--- run determinism ---\n' + ticking.text + '\n')
+  const ticks = Number(ticking.text.match(new RegExp(`${TICK}=(-?[\\d.]+)`))?.[1] ?? Number.NaN)
+  check('one second of project time is ~30 frames, not ~60', ticks >= 24 && ticks <= 36, `counter after 1s: ${ticks}`)
+  check('the run reports the rate it paced at', /at 30 fps/.test(ticking.text), ticking.text.split('\n')[0])
+  check('the run names what changed', new RegExp(`changed during the run: ${TICK}`).test(ticking.text), ticking.text)
+
+  // ── swapping ONE script ──────────────────────────────────────────────────
+  // The alternative used to be resending the whole sprite's XML to fix one statement.
+  await call('gandi_apply', {
+    mode: 'append',
+    xml: `<xml>
+      <block type="event_whenkeypressed" id="e2eKeepA" x="500" y="500"><field name="KEY_OPTION">a</field></block>
+      <block type="event_whenkeypressed" id="e2eKeepB" x="500" y="700"><field name="KEY_OPTION">b</field></block>
+    </xml>`
+  })
+  const beforeSwap = targetStats((await call('gandi_inspect', {})).text, subject)
+  // Selected by ID rather than by position: the script list's order is the runtime's
+  // business, and asserting on "the second one" made this check depend on it.
+  const swapped = await call('gandi_apply', {
+    mode: 'replaceScript',
+    script: 'e2eKeepB',
+    xml: '<xml><block type="event_whenkeypressed" id="e2eSwapped" x="500" y="700"><field name="KEY_OPTION">c</field></block></xml>'
+  })
+  console.log('--- replace one script ---\n' + swapped.text + '\n')
+  const afterSwapXml = await call('gandi_inspect', {})
+  const afterSwap = targetStats(afterSwapXml.text, subject)
+  check('swapping one script leaves the others alone',
+    beforeSwap !== null && afterSwap !== null && afterSwap.scripts === beforeSwap.scripts,
+    `${JSON.stringify(beforeSwap)} -> ${JSON.stringify(afterSwap)}`)
+  check('the named script was the one replaced, and the rest survived',
+    /mode replaceScript/.test(swapped.text) &&
+    /e2eSwapped/.test(afterSwapXml.text) &&
+    /e2eKeepA/.test(afterSwapXml.text) &&
+    !/e2eKeepB/.test(afterSwapXml.text),
+    swapped.text + '\n' + afterSwapXml.text.slice(-500))
+
+  // ── the stage image is a real capture ────────────────────────────────────
+  // A delivery judged three runs by an inline image whose sha256 never changed and
+  // concluded the stage was not rendering. The bytes have to differ when the picture
+  // differs; this is the regression test for that.
+  await call('gandi_apply', { target: subject, xml: '<xml><block type="event_whenflagclicked" id="e2eIdle" x="0" y="0"/></xml>' })
+  const shotHash = async (stageX) => {
+    await call('gandi_place', { target: subject, x: stageX, y: 0 })
+    const result = await call('gandi_run', { seconds: 0.1 })
+    const path = result.text.match(/written to (.+?\.png)/)?.[1]
+    if (path === undefined) return null
+    const bytes = await readFile(path)
+    await rm(path, { force: true })
+    return createHash('sha256').update(bytes).digest('hex')
+  }
+  const leftHash = await shotHash(-150)
+  const rightHash = await shotHash(150)
+  check('two runs of different stage states return different images',
+    leftHash !== null && rightHash !== null && leftHash !== rightHash,
+    `${leftHash?.slice(0, 12)} vs ${rightHash?.slice(0, 12)}`)
+
+  // ── variables can be put back to a starting value ────────────────────────
+  const RESET = `e2e_reset_${SUFFIX}`
+  await call('gandi_variable', { action: 'create', name: RESET })
+  await call('gandi_variable', { action: 'set', name: RESET, value: '123' })
+  const resetRun = await call('gandi_run', { seconds: 0.1, screenshot: false, resetVariables: true })
+  console.log('--- reset variables ---\n' + resetRun.text + '\n')
+  check('resetVariables zeroes a variable the script does not touch',
+    new RegExp(`${RESET}=0\\b`).test(resetRun.text), resetRun.text)
+  await call('gandi_variable', { action: 'delete', name: RESET })
+
   // ── sound ────────────────────────────────────────────────────────────────
   // Synthesized rather than uploaded, so this proves the WAV encoder produces
   // something the editor's own sound loader accepts.
@@ -580,6 +752,108 @@ const main = async () => {
   check('a synthesized sound was added', sound.text.includes(`added sound "e2e-blip-${SUFFIX}"`), sound.text)
   check('the sound reports its synthesized length', /synthesized \d+ frames at 48000 Hz/.test(sound.text), sound.text)
   check('the sprite lists the new sound', new RegExp(`sounds now: .*e2e-blip-${SUFFIX}`).test(sound.text), sound.text)
+
+  // ── renaming and deleting a sound ────────────────────────────────────────
+  const SOUND2 = `e2e-blip2-${SUFFIX}`
+  const RENAMED_SOUND = `e2e-blip-renamed-${SUFFIX}`
+  await call('gandi_sound', { name: SOUND2, frequency: 660, seconds: 0.1 })
+  const renamedSound = await call('gandi_sound', { action: 'rename', name: `e2e-blip-${SUFFIX}`, newName: RENAMED_SOUND })
+  console.log('--- sound rename ---\n' + renamedSound.text + '\n')
+  check('a sound can be renamed', new RegExp(`renamed sound on .*${RENAMED_SOUND}`).test(renamedSound.text), renamedSound.text)
+
+  const deletedSound = await call('gandi_sound', { action: 'delete', name: SOUND2 })
+  check('a sound can be deleted',
+    deletedSound.text.includes(`deleted sound "${SOUND2}"`) && !new RegExp(`${SOUND2}\\)?\\n`).test(deletedSound.text),
+    deletedSound.text)
+
+  // ── the lease, from two sessions ─────────────────────────────────────────
+  // Every mutating tool could always be blocked by another session; what a delivery
+  // could not do was get past it, because the message offered `force` and no schema
+  // accepted it. Both halves are checked here.
+  const leaseStatus = await call('gandi_lease', {}, 'e2e-session-a')
+  console.log('--- lease ---\n' + leaseStatus.text + '\n')
+  check('the lease can be inspected without an editor call', /lease: (free|session)/.test(leaseStatus.text), leaseStatus.text)
+
+  const takenLease = await call('gandi_lease', { action: 'take' }, 'e2e-session-a')
+  check('a session can take the lease', /you hold it now|took the lease/.test(takenLease.text), takenLease.text)
+
+  const blocked = await call('gandi_apply', { xml: '<xml><block type="event_whenflagclicked" id="e2eBlocked"/></xml>' }, 'e2e-session-b')
+    .then(() => null, (error) => error)
+  check('another session is refused, and told both ways out',
+    blocked !== null && /is driving Gandi/.test(blocked.message) && /force: true/.test(blocked.message) && /gandi_lease/.test(blocked.message),
+    blocked?.message ?? 'the call was NOT blocked — the lease is not being enforced')
+
+  const forced = await call('gandi_apply', { force: true, xml: '<xml><block type="event_whenflagclicked" id="e2eForced"/></xml>' }, 'e2e-session-b')
+    .then((result) => result, (error) => error)
+  check('force gets past a lease held by someone else',
+    forced !== null && typeof forced.text === 'string' && /applied \d+ block\(s\)/.test(forced.text),
+    forced?.message ?? String(forced?.text))
+
+  // Taking over means taking over: the session that forced its way in now holds it, so
+  // the original holder is the one that gets told to wait.
+  const afterForce = await call('gandi_lease', {}, 'e2e-session-a')
+  check('the session that forced the edit now holds the lease', /held by e2e-session-b/.test(afterForce.text), afterForce.text)
+
+  const released = await call('gandi_lease', { action: 'release' }, 'e2e-session-a')
+  check('a session that does not hold it cannot release it', /holds the lease, not you/.test(released.text), released.text)
+
+  await call('gandi_lease', { action: 'release' }, 'e2e-session-b')
+  const freeAgain = await call('gandi_apply', { xml: '<xml><block type="event_whenflagclicked" id="e2eFree"/></xml>' })
+  check('after a release any session works without force', /applied \d+ block\(s\)/.test(freeAgain.text), freeAgain.text)
+  // Leave it as it was found: the rest of this run, and anyone else's session, should
+  // not have to take a lease away from a test.
+  const leftFree = await call('gandi_lease', { action: 'release' })
+  check('the lease is handed back at the end', /released|already free/.test(leftFree.text), leftFree.text)
+
+  // ── the load check, and what it catches ──────────────────────────────────
+  // The three P0 failures all looked identical from the outside: the project would not
+  // open, and the error named something else. This is the check that finds them by
+  // reading the file.
+  const verified = await call('gandi_verify', { path: savePath })
+  console.log('--- verify (clean file) ---\n' + verified.text + '\n')
+  check('a project the editor exported passes the load check', /no problems found/.test(verified.text), verified.text)
+
+  // Build the file that broke a delivery: a broadcast dropdown materialised as a block
+  // with an opcode that is not a Scratch block. Offline, because loading it is exactly
+  // what makes the editor unusable.
+  const brokenProject = JSON.parse(JSON.stringify(container.project))
+  const brokenTarget = brokenProject.targets.find((target) => !target.isStage)
+  brokenTarget.blocks.e2eBadShadow = {
+    opcode: 'broadcast_msg',
+    next: null,
+    parent: null,
+    inputs: {},
+    fields: { BROADCAST_OPTION: ['go', 'message1'] },
+    shadow: true,
+    topLevel: false
+  }
+  const brokenPath = join(outDir, 'broken.sb3')
+  await writeFile(brokenPath, writeSb3(brokenProject, container.assets))
+  const brokenCheck = await call('gandi_verify', { path: brokenPath })
+  console.log('--- verify (broken file) ---\n' + brokenCheck.text + '\n')
+  check('an invented opcode is caught before anything tries to open it',
+    /broadcast_msg/.test(brokenCheck.text) && /"broadcast" prefix is not a Scratch category/.test(brokenCheck.text),
+    brokenCheck.text)
+
+  // The live check: the editor's own deserializer, then the previous project back. This
+  // is the only check that cannot be wrong in either direction.
+  const liveCheck = await call('gandi_verify', { path: savePath, live: true })
+  console.log('--- verify (live) ---\n' + liveCheck.text + '\n')
+  check('the editor itself opens an exported project', /the editor OPENED it/.test(liveCheck.text), liveCheck.text)
+  check('and what was open is put back', /restored what was open: \d+ target/.test(liveCheck.text), liveCheck.text)
+
+  // ── merging one writer's sprites into another project ────────────────────
+  // The multi-agent finish: take a sprite from a file another writer produced, with its
+  // variables, its lists, its costumes and the asset bytes behind them.
+  const mergeOut = join(outDir, 'merged.sb3')
+  const merged = await call('gandi_merge', { from: savePath, path: savePath, outPath: mergeOut, targets: [subject] })
+  console.log('--- merge ---\n' + merged.text + '\n')
+  check('the named sprite was taken', new RegExp(`took ${subject}: \\d+ block\\(s\\)`).test(merged.text), merged.text)
+  check('the merge reports its own load check', /load check/.test(merged.text), merged.text)
+  const mergedCheck = await call('gandi_verify', { path: mergeOut })
+  check('the merged project still passes the load check', /no problems found/.test(mergedCheck.text), mergedCheck.text)
+  const mergedContainer = readSb3(await readFile(mergeOut))
+  check('the merge carried the assets across', mergedContainer.warnings.length === 0, mergedContainer.warnings)
 
   // ── a brand-new empty actor ──────────────────────────────────────────────
   const actorSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48">' +

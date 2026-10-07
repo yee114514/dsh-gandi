@@ -110,6 +110,8 @@ test('registers the full tool surface with valid definitions', () => {
     'gandi_input',
     'gandi_inspect',
     'gandi_launch',
+    'gandi_lease',
+    'gandi_merge',
     'gandi_new',
     'gandi_observe',
     'gandi_open',
@@ -121,7 +123,8 @@ test('registers the full tool surface with valid definitions', () => {
     'gandi_sprite',
     'gandi_status',
     'gandi_stop',
-    'gandi_variable'
+    'gandi_variable',
+    'gandi_verify'
   ])
   for (const [toolName, definition] of h.tools) {
     assert.equal(typeof definition.description, 'string', `${toolName} needs a description`)
@@ -262,7 +265,9 @@ test('an explicit config value wins over the environment', async () => {
 
 test('every tool is marked either concurrency-safe or exclusive', () => {
   const h = harness()
-  const readOnly = ['gandi_status', 'gandi_inspect', 'gandi_observe', 'gandi_screenshot', 'gandi_save']
+  // gandi_lease only touches the in-process lease, and gandi_verify's default path only
+  // reads a file; its live: true path takes the lease and the mutex itself.
+  const readOnly = ['gandi_status', 'gandi_inspect', 'gandi_observe', 'gandi_screenshot', 'gandi_save', 'gandi_lease', 'gandi_verify']
   for (const [toolName, definition] of h.tools) {
     const safe = definition.isConcurrencySafe({})
     if (readOnly.includes(toolName)) {
@@ -271,6 +276,72 @@ test('every tool is marked either concurrency-safe or exclusive', () => {
       assert.equal(safe, false, `${toolName} mutates the editor and must not run in parallel`)
     }
   }
+})
+
+test('every mutating tool can actually be told to take the lease', () => {
+  // The lease conflict message tells the caller to "pass force: true to take over".
+  // That has to be reachable: a schema with additionalProperties: false strips anything
+  // it does not declare, so a promise like that is only as good as the parameter list.
+  const h = harness()
+  let mutating = 0
+  for (const [toolName, definition] of h.tools) {
+    if (definition.isConcurrencySafe({}) === true) continue
+    mutating++
+    const properties = definition.parameters?.properties ?? {}
+    assert.ok(properties.force, `${toolName} is mutating but does not accept force`)
+    assert.equal(properties.force.type, 'boolean', `${toolName}: force must be a boolean`)
+    assert.ok(properties.force.description.length > 30, `${toolName}: force needs a description a model can act on`)
+  }
+  assert.ok(mutating > 5, 'the surface should still have its mutating tools')
+  // A read-only tool has no business taking a lease, and offering the parameter there
+  // would invite a caller to think it can.
+  assert.equal(h.tools.get('gandi_status').parameters.properties.force, undefined)
+})
+
+test('gandi_apply refuses XML the editor could not open, and names the fix', async () => {
+  const h = harness()
+  // The clone dropdown written as a costume menu: this compiled clean once, reported no
+  // warnings, and produced a game where nothing was ever cloned. It now never reaches
+  // the editor.
+  await assert.rejects(
+    () => h.call('gandi_apply', {
+      xml: `<xml>
+        <block type="control_create_clone_of" id="clone" x="0" y="0">
+          <value name="CLONE_OPTION"><shadow type="looks_costume"><field name="COSTUME">_myself_</field></shadow></value>
+        </block>
+      </xml>`
+    }),
+    (error) => {
+      assert.match(error.message, /would make the project unusable/)
+      assert.match(error.message, /takes the dropdown <shadow type="control_create_clone_of_menu">/)
+      return true
+    }
+  )
+  // ...and the broadcast one, which used to produce a project that would not open at all.
+  await assert.rejects(
+    () => h.call('gandi_apply', {
+      xml: `<xml>
+        <block type="event_broadcast" id="send" x="0" y="0">
+          <value name="BROADCAST_INPUT"><shadow type="broadcast_msg"><field name="BROADCAST_OPTION">go</field></shadow></value>
+        </block>
+      </xml>`
+    }),
+    /`broadcast_msg` is the type of a broadcast VARIABLE/
+  )
+})
+
+test('gandi_verify checks a file without an editor, and refuses to guess at one it cannot read', async () => {
+  const h = harness()
+  await assert.rejects(() => h.call('gandi_verify', {}), /path must be a non-empty string/)
+  // A path that is not there is reported as such rather than as a load failure.
+  await assert.rejects(() => h.call('gandi_verify', { path: 'no-such-project.sb3' }), /ENOENT|no such file/i)
+})
+
+test('gandi_lease reports and hands over the edit lease', async () => {
+  const h = harness()
+  const { value } = await h.call('gandi_lease')
+  assert.match(value.text, /status: the lease is free/)
+  await assert.rejects(() => h.call('gandi_lease', { action: 'nap' }), /unknown action "nap"/)
 })
 
 test('gandi_costume validates its input before touching the editor', async () => {

@@ -7,10 +7,14 @@
  * its lease) rather than calling the lower layers, so a regression anywhere in the
  * stack shows up here.
  *
- *   node tools/e2e.mjs [--port 9222] [--keep]
+ *   node tools/e2e.mjs [--port 9222] [--keep] [--front]
  *
  * The user's open project is snapshotted first and restored at the end; `--keep`
  * skips the restore when you want to look at the result yourself.
+ *
+ * `--front` means "I will keep the Gandi window in front": it turns on the checks about
+ * what the USER can see (which need the window on screen and are otherwise skipped, since
+ * raising it would steal the user's focus — something this plugin never does).
  */
 
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
@@ -20,7 +24,8 @@ import { fileURLToPath } from 'node:url'
 import { deflateSync } from 'node:zlib'
 
 import { apply } from '../src/index.mjs'
-import { listTargets, CdpConnection } from '../src/bridge/cdp.mjs'
+import { listGandiProcesses } from '../src/bridge/app.mjs'
+import { listTargets, CdpConnection, evaluate } from '../src/bridge/cdp.mjs'
 import { getProjectJson, exportSb3, loadProjectBytes } from '../src/bridge/ops.mjs'
 import { readSb3, writeSb3 } from '../src/scratch/sb3.mjs'
 import { crc32 } from '../src/scratch/zip.mjs'
@@ -79,14 +84,33 @@ const argOf = (flag, fallback) => {
   return index === -1 ? fallback : argv[index + 1]
 }
 const keep = argv.includes('--keep')
+// Whether the operator promises the Gandi window is (or will be) in front. Only the
+// visibility checks care, and they would otherwise be skipped on a machine where the
+// window happens to be behind something.
+const front = argv.includes('--front')
 const port = Number(argOf('--port', process.env.GANDI_PORT ?? '9222'))
 
 let failures = 0
 let checks = 0
+let skipped = 0
 const check = (label, condition, detail) => {
   checks++
   if (!condition) failures++
   console.log(`[${condition ? 'PASS' : 'FAIL'}] ${label}${detail === undefined ? '' : ` — ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`}`)
+}
+
+/**
+ * A check that could not run in this environment, stated as such.
+ *
+ * The house rule is that an assertion must not depend on machine state (an earlier version
+ * pinned a wording and stayed green only because the test machine happened to have an
+ * editor open). Whether the Gandi window is VISIBLE to the desktop is exactly that kind of
+ * state — and forcing it would steal the user's focus, which the plugin must never do. So
+ * the check is skipped out loud rather than faked either way.
+ */
+const skip = (label, why) => {
+  skipped++
+  console.log(`[SKIP] ${label} — ${why}`)
 }
 
 /**
@@ -831,9 +855,15 @@ const main = async () => {
   await writeFile(brokenPath, writeSb3(brokenProject, container.assets))
   const brokenCheck = await call('gandi_verify', { path: brokenPath })
   console.log('--- verify (broken file) ---\n' + brokenCheck.text + '\n')
+  // The check runs with and without an editor, and the editor's answer is what decides
+  // whether "broadcast" is an unknown extension or merely an undeclared one. So this
+  // asserts the part that must hold either way — the invented opcode is named, and it is
+  // explained as an extension id rather than as a typo — instead of pinning one wording.
+  const broadcastLine = brokenCheck.text.split('\n').find((line) => line.includes('broadcast') && line.includes('extension')) ?? ''
   check('an invented opcode is caught before anything tries to open it',
-    /broadcast_msg/.test(brokenCheck.text) && /"broadcast" prefix is not a Scratch category/.test(brokenCheck.text),
-    brokenCheck.text)
+    /broadcast_msg/.test(brokenCheck.text) && /"broadcast"/.test(broadcastLine) &&
+    /not a Scratch category|not declare/.test(broadcastLine),
+    broadcastLine === '' ? brokenCheck.text : broadcastLine)
 
   // The live check: the editor's own deserializer, then the previous project back. This
   // is the only check that cannot be wrong in either direction.
@@ -894,6 +924,163 @@ const main = async () => {
   const freshState = await call('gandi_inspect', {})
   check('the starter sprite is real and empty', new RegExp(`${starterName} — 0 script\\(s\\), 0 block\\(s\\), costumes: costume1`).test(freshState.text), freshState.text)
 
+  // ── the Gandi the user already has open ──────────────────────────────────
+  //
+  // Two behaviours the user asked for explicitly: never start a second window while one
+  // is running (adopt it instead), and make sure the editor the bridge drives is the view
+  // ON SCREEN — "the model says it is working, but I only see the home page" was a real
+  // report. The second half needs the Gandi window to be visible to the desktop, which no
+  // script may force (raising it would steal the user's focus), so it runs when the window
+  // happens to be in front, or when the operator asks for it with --front.
+  const processesBefore = await listGandiProcesses()
+  const relaunch = await call('gandi_launch', { timeoutMs: 90000 })
+  console.log('--- gandi_launch, with a Gandi already running ---\n' + relaunch.text + '\n')
+  const processesAfter = await listGandiProcesses()
+  if (processesBefore !== null && processesAfter !== null) {
+    check('a second gandi_launch does NOT start another Gandi window',
+      processesAfter.length === processesBefore.length,
+      `${processesBefore.length} -> ${processesAfter.length} process(es)`)
+  } else {
+    skip('a second gandi_launch does NOT start another Gandi window', 'process list unavailable on this machine')
+  }
+  check('...it says it adopted the running one', /adopted the running Gandi/.test(relaunch.text), relaunch.text.split('\n')[0])
+  check('...and reports where the editor view is', /editor view: /.test(relaunch.text))
+
+  const shellTarget = (await listTargets(port)).find((target) => typeof target.url === 'string' && target.url.endsWith('index.html'))
+  if (shellTarget === undefined) {
+    skip('the editor view can be brought back to the front', 'no shell page target found')
+  } else {
+    const shell = await CdpConnection.connect(shellTarget.webSocketDebuggerUrl)
+    try {
+      const shellVisible = async () => evaluate(shell, 'document.visibilityState').then((value) => value === 'visible').catch(() => false)
+      const surfaceState = async () => {
+        const text = (await call('gandi_status')).text
+        return (text.match(/editor on screen: (.+)/) ?? [])[1] ?? '(not reported)'
+      }
+      let visible = await shellVisible()
+      if (!visible && front) {
+        console.log('(waiting up to 60s for the Gandi window to be visible: bring it to the front)')
+        for (let attempt = 0; attempt < 30 && !visible; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+          visible = await shellVisible()
+        }
+      }
+
+      if (!visible) {
+        skip('the editor view can be brought back to the front', 'the Gandi window is behind another window (the bridge never raises it)')
+        check('...and status says so rather than claiming the user can see it',
+          /behind another window|is the one on screen|another Gandi view/.test(await surfaceState()),
+          await surfaceState())
+      } else {
+        check('the editor the bridge drives is the view on screen',
+          /is the one on screen/.test(await surfaceState()), await surfaceState())
+
+        // What the user does: click the home tab (the project browser) in Gandi's own strip.
+        const box = await evaluate(shell, `(() => {
+          const tab = document.querySelectorAll('.MuiTab-root')[0];
+          if (tab === undefined) return null;
+          const rect = tab.getBoundingClientRect();
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        })()`)
+        if (box === null) {
+          skip('clicking home hides the editor', 'the shell has no tab strip to click')
+        } else {
+          for (const type of ['mousePressed', 'mouseReleased']) {
+            await shell.send('Input.dispatchMouseEvent', { type, x: box.x, y: box.y, button: 'left', clickCount: 1, buttons: 1 })
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2500))
+          check('clicking home in Gandi hides the editor view (the user\'s report, reproduced)',
+            /another Gandi view/.test(await surfaceState()), await surfaceState())
+
+          // One mutating call is all it takes for the bridge to put it back.
+          const placed = await call('gandi_place', { x: 0, y: 0 })
+          check('the next edit brings the editor back to the front',
+            /is the one on screen/.test(await surfaceState()), await surfaceState())
+          check('...and the tool result explains what happened to the user\'s screen',
+            /NOTE: the editor was made the active view/.test(placed.text), placed.text.split('\n').slice(-1)[0])
+        }
+      }
+    } finally {
+      shell.close()
+    }
+  }
+
+  // ── extensions ───────────────────────────────────────────────────────────
+  // The whole point of this section: an extension block cannot be written until the
+  // extension is LOADED, because its opcode, inputs and dropdown shadow exist only in
+  // the running editor. So the run loads one, writes a script with it (menu shadow and
+  // all), saves it, and reads it back — the four steps a delivery takes.
+  {
+    const listed = await call('gandi_extension', {})
+    console.log('--- gandi_extension (list) ---\n' + listed.text.split('\n').slice(0, 12).join('\n') + '\n…\n')
+    check('the editor reports its extension catalogue', /library: \d+ extension\(s\)/.test(listed.text), listed.text.split('\n')[0])
+    check('the catalogue names the ids a caller can load', /(^|\n)\s+\*?\s?music\b/m.test(listed.text))
+
+    const loaded = await call('gandi_extension', { action: 'load', id: 'music' })
+    console.log('--- gandi_extension (load music) ---\n' + loaded.text.split('\n').slice(0, 6).join('\n') + '\n…\n')
+    // Idempotent by design: a second run finds it loaded and says so, rather than
+    // rejecting (the editor itself refuses to register an extension twice).
+    check('music is loaded (or was already)', /loaded music into the editor|music was already loaded/.test(loaded.text), loaded.text.split('\n')[0])
+    check('the dialect names the block type the project will carry', /<block type="music_restForBeats">/.test(loaded.text))
+    check('...and the dropdown shadow under it', /<shadow type="music_menu_DRUM">/.test(loaded.text))
+
+    const extensionScript = `<xml>
+      <block type="event_whenflagclicked" id="extHat" x="40" y="40">
+        <next>
+          <block type="music_restForBeats" id="extRest">
+            <value name="BEATS"><shadow type="math_number" id="extBeats"><field name="NUM">0</field></shadow></value>
+            <next>
+              <block type="music_playDrumForBeats" id="extDrum">
+                <value name="DRUM"><shadow type="music_menu_DRUM" id="extMenu"><field name="DRUM">1</field></shadow></value>
+                <value name="BEATS"><shadow type="math_number" id="extBeats2"><field name="NUM">0.1</field></shadow></value>
+              </block>
+            </next>
+          </block>
+        </next>
+      </block>
+    </xml>`
+
+    const extDry = await call('gandi_apply', { xml: extensionScript, dryRun: true })
+    check('a dry run of extension blocks compiles against the editor\'s own definitions',
+      /checked against the editor's own definitions/.test(extDry.text), extDry.text)
+    check('...and names the extension it needs', /extensions this script needs: music/.test(extDry.text))
+
+    const extApplied = await call('gandi_apply', { xml: extensionScript })
+    console.log('--- apply (extension blocks) ---\n' + extApplied.text + '\n')
+    check('extension blocks were created', /applied \d+ block\(s\)/.test(extApplied.text))
+    check('...and the result says which extension they came from', /extension blocks written: music/.test(extApplied.text))
+
+    // The editor holds them with the prefixed opcode — that prefix is the whole reason a
+    // project can be reopened without the extension list.
+    const afterApply = await getProjectJson(connection)
+    const opcodes = afterApply.targets.flatMap((t) => Object.values(t.blocks ?? {}).map((b) => b.opcode))
+    check('the editor stored the prefixed opcode', opcodes.includes('music_restForBeats'), opcodes.filter((op) => op.startsWith('music_')).join(', '))
+    check('...and the dropdown menu as a real shadow block', opcodes.includes('music_menu_DRUM'))
+
+    // Save it, and read the file back with the offline reader: the archive is the thing
+    // another tool sees, so the extension list and the shadow have to be in it.
+    const savedPath = join(outDir, 'extension-project.sb3')
+    const saved = await call('gandi_save', { path: savedPath })
+    check('the project with extension blocks saves', /saved \d+ bytes/.test(saved.text), saved.text)
+    const savedContainer = readSb3(await readFile(savedPath))
+    check('the saved document declares the extension it uses', (savedContainer.project.extensions ?? []).includes('music'),
+      savedContainer.project.extensions)
+    const savedMenu = Object.values(savedContainer.project.targets.flatMap((t) => Object.values(t.blocks ?? {})))
+      .find((b) => !Array.isArray(b) && b.opcode === 'music_menu_DRUM')
+    check('the saved document keeps the dropdown shadow and its field',
+      savedMenu !== undefined && savedMenu.shadow === true && JSON.stringify(savedMenu.fields) === JSON.stringify({ DRUM: ['1'] }),
+      savedMenu)
+
+    const verified = await call('gandi_verify', { path: savedPath })
+    check('the offline load check accepts it', !/errors \(/.test(verified.text), verified.text)
+    check('...and says the extension blocks were judged against this editor',
+      /judged against the \d+ extension id\(s\) this editor offers/.test(verified.text))
+
+    // Running it is the only way to know the blocks actually resolve at runtime.
+    const extRun = await call('gandi_run', { seconds: 0.6, screenshot: false })
+    check('a script of extension blocks runs without a runtime error', !/error/i.test(extRun.text.split('\n')[0]), extRun.text.split('\n')[0])
+  }
+
   // ── restore ──────────────────────────────────────────────────────────────
     if (!keep) {
       await loadProjectBytes(connection, originalArchive)
@@ -905,7 +1092,7 @@ const main = async () => {
       console.log('(keeping the edited project: --keep)')
     }
 
-    console.log(`\n${checks - failures}/${checks} checks passed`)
+    console.log(`\n${checks - failures}/${checks} checks passed${skipped > 0 ? ` (${skipped} skipped: see [SKIP] above)` : ''}`)
     if (failures > 0) process.exitCode = 1
   } finally {
     // A lingering CDP socket keeps the event loop alive and would hang the script:

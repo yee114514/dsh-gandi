@@ -40,11 +40,33 @@ const CORE_PREFIXES = new Set([
  * Extensions Gandi can load on demand. A block from one of these is fine even when the
  * project does not list it — the deserializer calls `loadExtensionIdSync` and gets it.
  * Anything else is either a typo or an extension this project would have to declare.
+ *
+ * This list is only the FALLBACK. The editor's own catalogue is authoritative (93 ids on
+ * Gandi 1.0.5, most of them community extensions that were never Scratch built-ins), so
+ * callers that can reach an editor pass what it knows in as `options.knownExtensions`.
+ * Keeping a short list here is what lets the check still say something useful offline.
  */
 const BUILT_IN_EXTENSIONS = new Set([
-  'music', 'pen', 'video', 'text2speech', 'translate', 'makeymakey', 'microbit',
-  'ev3', 'boost', 'gdxfor', 'speech', 'gandi', 'ccw', 'tw', 'pm', 'files', 'cloud'
+  'music', 'pen', 'video', 'videoSensing', 'text2speech', 'translate', 'makeymakey',
+  'microbit', 'ev3', 'boost', 'gdxfor', 'speech', 'gandi', 'ccw', 'tw', 'pm', 'files',
+  'cloud', 'wedo2', 'coreExample', 'teaching'
 ])
+
+/**
+ * The sets of extension ids a project's blocks are judged against.
+ *
+ * @param {any} project parsed project document
+ * @param {{knownExtensions?: Iterable<string>}} [options] what the editor can load
+ * @returns {{declared: Set<string>, available: Set<string>}} declared in the document, and loadable
+ */
+const extensionSets = (project, options = {}) => {
+  const declared = new Set(
+    (Array.isArray(project?.extensions) ? project.extensions : []).map((id) => String(id))
+  )
+  const available = new Set([...BUILT_IN_EXTENSIONS, ...declared])
+  for (const id of options.knownExtensions ?? []) available.add(String(id))
+  return { declared, available }
+}
 
 /** Field names that carry a variable, list or broadcast id in their `id` slot. */
 const REFERENCE_FIELDS = new Set(['VARIABLE', 'LIST', 'BROADCAST_OPTION'])
@@ -189,12 +211,13 @@ const checkReferencePrimitive = ({ where, id, description, context }) => {
  * Check one target's blocks.
  *
  * @param {any} target a project target
- * @param {{declared: Set<string>, stageDeclared: Set<string>, report: VerifyReport}} context the surrounding project
+ * @param {{declared: Set<string>, stageDeclared: Set<string>, report: VerifyReport, extensions: {declared: Set<string>, available: Set<string>}}} context the surrounding project
  */
 const checkTargetBlocks = (target, context) => {
   const blocks = target.blocks ?? {}
   const { errors, warnings, notes } = context.report
   const where = `${target.name}${target.isStage ? ' (stage)' : ''}`
+  const unknownExtensions = new Map()
 
   for (const [id, block] of Object.entries(blocks)) {
     if (Array.isArray(block)) {
@@ -212,9 +235,14 @@ const checkTargetBlocks = (target, context) => {
     }
 
     const extension = extensionPrefix(block.opcode)
-    if (extension !== null && !BUILT_IN_EXTENSIONS.has(extension)) {
-      warnings.push(`${where}: block ${id} has opcode "${block.opcode}", whose "${extension}" prefix is not a Scratch category. ` +
-        'The editor reads that prefix as an extension id and refuses to open the project if it cannot load it')
+    if (extension !== null && !context.extensions.available.has(extension)) {
+      // Collected per extension rather than emitted per block: a project that uses an
+      // extension has hundreds of its blocks, and one line naming the extension is the
+      // whole finding. This is also the difference between "you misspelled an opcode"
+      // and "this is an extension block from something this editor cannot load".
+      const entry = unknownExtensions.get(extension) ?? { count: 0, sample: block.opcode, id }
+      entry.count++
+      unknownExtensions.set(extension, entry)
     }
 
     checkMutation(id, block, errors)
@@ -250,6 +278,12 @@ const checkTargetBlocks = (target, context) => {
     }
   }
 
+  for (const [extension, entry] of unknownExtensions) {
+    warnings.push(`${where}: ${entry.count} block(s) name the extension "${extension}" (e.g. ${entry.sample}), which this project does ` +
+      `not declare and the editor was not seen to offer. The editor reads that prefix as an extension id and refuses to open the ` +
+      'whole project if it cannot load it')
+  }
+
   // Reachability: a script that no top-level block reaches is invisible in the editor
   // but stays in the file, and it is what a deleted script leaves behind.
   const reachable = new Set()
@@ -283,7 +317,7 @@ const checkTargetBlocks = (target, context) => {
  * Check a whole project document.
  *
  * @param {any} project parsed `project.json`
- * @param {{assets?: Map<string, Buffer>|Record<string, any>, assetCount?: number}} [options] the archive contents, when there are any
+ * @param {{assets?: Map<string, Buffer>|Record<string, any>, assetCount?: number, knownExtensions?: Iterable<string>}} [options] the archive contents, when there are any, and the extension ids the editor was seen to offer
  * @returns {VerifyReport} what was found
  */
 export const verifyProject = (project, options = {}) => {
@@ -296,6 +330,7 @@ export const verifyProject = (project, options = {}) => {
   }
   const stage = targets.find((target) => target.isStage === true)
   if (stage === undefined) report.errors.push('the project has no stage target')
+  const extensions = extensionSets(project, options)
 
   for (const target of targets) {
     const declared = new Set([
@@ -310,7 +345,7 @@ export const verifyProject = (project, options = {}) => {
           ...Object.keys(stage.lists ?? {}),
           ...Object.keys(stage.broadcasts ?? {})
         ])
-    checkTargetBlocks(target, { declared, stageDeclared, report })
+    checkTargetBlocks(target, { declared, stageDeclared, report, extensions })
 
     const blocks = target.blocks ?? {}
     report.stats.blocks += Object.keys(blocks).length
@@ -338,6 +373,20 @@ export const verifyProject = (project, options = {}) => {
       }
       if (options.assets !== undefined && !hasAsset(options.assets, md5ext)) {
         report.errors.push(`${target.name}: sound "${sound.name}" references asset ${md5ext}, which is not in the archive`)
+      }
+    }
+  }
+
+  // The document's own extension list is a record of what the project uses. Naming it
+  // matters because it is what every other Scratch tool reads back, and because a
+  // project whose blocks name an extension it does not declare still opens (the
+  // deserializer works from the opcode prefix) — so a missing entry is easy to miss.
+  if (extensions.declared.size > 0) {
+    const ids = [...extensions.declared]
+    report.notes.push(`the project declares extension(s): ${ids.join(', ')}`)
+    for (const id of ids) {
+      if (!extensions.available.has(id)) {
+        report.warnings.push(`the project declares the extension "${id}", which this editor was not seen to offer; opening the project will fail if it cannot load it`)
       }
     }
   }

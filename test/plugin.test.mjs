@@ -107,6 +107,7 @@ test('registers the full tool surface with valid definitions', () => {
   assert.deepEqual([...h.tools.keys()].sort(), [
     'gandi_apply',
     'gandi_costume',
+    'gandi_extension',
     'gandi_input',
     'gandi_inspect',
     'gandi_launch',
@@ -346,10 +347,10 @@ test('gandi_lease reports and hands over the edit lease', async () => {
 
 test('gandi_costume validates its input before touching the editor', async () => {
   const h = harness()
-  await assert.rejects(() => h.call('gandi_costume', {}), /pass exactly one of `svg` or `base64`/)
+  await assert.rejects(() => h.call('gandi_costume', {}), /pass exactly one of "svg" or "base64"/)
   await assert.rejects(
     () => h.call('gandi_costume', { svg: '<svg/>', base64: 'AAAA' }),
-    /pass exactly one of `svg` or `base64`/
+    /pass exactly one of "svg" or "base64"/
   )
   // Structural problems must be caught here, not installed as an invisible costume.
   await assert.rejects(() => h.call('gandi_costume', { svg: '<div>nope</div>' }), /does not contain an <svg> element/)

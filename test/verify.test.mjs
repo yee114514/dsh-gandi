@@ -103,7 +103,9 @@ test('an invented opcode is reported as the extension the editor will try to loa
   assert.equal(report.errors.length, 1)
   assert.match(report.errors[0], /input BROADCAST_INPUT uses the shadow block broadcast_msg, but the editor expects event_broadcast_menu/)
   assert.match(report.errors[0], /broadcast_msg is a variable type/)
-  assert.match(report.warnings.join('\n'), /"broadcast" prefix is not a Scratch category/)
+  // The warning names the extension the editor would try to load, once for the
+  // extension rather than once per block (a real extension project has hundreds).
+  assert.match(report.warnings.join('\n'), /name the extension "broadcast"/)
 })
 
 test('a dropdown holding an inlined primitive is reported', () => {

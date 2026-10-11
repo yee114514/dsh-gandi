@@ -85,6 +85,34 @@ export async function listTargets (port, options = {}) {
 }
 
 /**
+ * What a debug port says about itself.
+ *
+ * This is how the bridge tells GANDI's port from somebody else's: a Chromium app that
+ * happens to sit on 9222 answers `/json/list` just as happily, and attaching to it
+ * would produce a page with no VM and a very confusing error. Gandi's user agent
+ * carries `gandi-desktop/<version>`, measured on v1.0.5:
+ * `Mozilla/5.0 … gandi-desktop/1.0.5 Chrome/124.0.6367.243 Electron/30.1.0 …`.
+ *
+ * @param {number} port TCP port of the debug endpoint
+ * @param {{timeoutMs?: number, host?: string}} [options] request options
+ * @returns {Promise<{browser: string, userAgent: string, webSocketDebuggerUrl: string}|null>} the version block, or null when the port is not a Gandi one
+ */
+export async function readBrowserVersion (port, options = {}) {
+  const host = options.host ?? '127.0.0.1'
+  const timeoutMs = options.timeoutMs ?? 2000
+  let response
+  try {
+    response = await fetch(`http://${host}:${port}/json/version`, { signal: AbortSignal.timeout(timeoutMs) })
+  } catch {
+    return null
+  }
+  if (!response.ok) return null
+  const version = await response.json().catch(() => null)
+  if (version === null || typeof version !== 'object') return null
+  return version
+}
+
+/**
  * One connected CDP session.
  *
  * Commands are matched to replies by id; unmatched messages are dispatched to

@@ -8,13 +8,10 @@
 
 ## 三条硬规则
 
-1. **不要修改 Gandi 的任何代码。** 桥接只在运行时通过 CDP 驱动它：不碰 `app.asar`、不反编译、
-   不注入脚本文件。安装目录（`E:\Gandi`）只读，也**不要**把解包出来的代码当上游读——
-   上游是公开的 `Gandi-IDE/scratch-vm`（见 `docs/gandi-spike.md`），那才是该对着写的地方。
-2. **零第三方依赖。** 只能用 `node:*`。这个包是被加载进宿主进程的，多一个依赖就多一份
+1. **零第三方依赖。** 只能用 `node:*`。这个包是被加载进宿主进程的，多一个依赖就多一份
    拖垮宿主启动的风险。已有能力都是手写的：ZIP 读写、XML 解析、WAV 编码、CDP 客户端
    （用 Node 全局 `WebSocket`）。
-3. **可选服务一律软探测，缺了必须静默降级。** `attachments` / `skills` / `systemPrompt`
+2. **可选服务一律软探测，缺了必须静默降级。** `attachments` / `skills` / `systemPrompt`
    在有些部署里不存在；拿不到就走降级路径（例如截图写成 PNG 文件并告诉模型去读），
    **绝不能因此抛错或影响宿主启动**。
 
@@ -22,12 +19,15 @@
 
 | 位置 | 是什么 |
 | --- | --- |
-| `src/index.mjs` | 插件入口：20 个工具的注册、参数校验、输出渲染。改工具面只改这里 |
+| `src/index.mjs` | 插件入口：21 个工具的注册、参数校验、输出渲染。改工具面只改这里 |
 | `src/plugin/service.mjs` | 进程级单例 `BridgeService`：互斥链、会话租约、attach 判定、错误话术 |
 | `src/bridge/cdp.mjs` | CDP 客户端（零依赖）。`evaluate` / `callFunction`，错误会带**页面侧调用栈** |
-| `src/bridge/app.mjs` | 找与记住 `Gandi.exe`、探测 target、拉起、向 shell 要一个编辑器页签、等编辑器就绪 |
+| `src/bridge/app.mjs` | 找与记住 `Gandi.exe`、探测 target、拉起、向 shell 要一个编辑器页签、等编辑器就绪、**发现"已经开着的那个 Gandi"**（命令行端口 / `DevToolsActivePort` / `CloseMainWindow` 礼貌关闭） |
+| `src/bridge/launcher.mjs` | **造一个带调试端口的 Gandi 快捷方式**（用户级开始菜单；或把开关写进已有快捷方式），让用户自己开的 Gandi 也能被接管 |
+| `src/bridge/surface.mjs` | **"用户现在看不看得见编辑器"**：逐视图 `visibilityState`、`beforeSwitchView`+`switchView` 切回最前、切不动才重建视图并把工程搬过去 |
 | `src/bridge/gandi-vm.mjs` | 页面侧**找 VM** 的解析器与引导片段（Gandi 没有 `window.vm`，见下） |
 | `src/bridge/ops.mjs` | **所有页面侧操作都在这里**，页面源码以模板字符串内嵌，每条都以 `${vmBootstrapSource()}` 开头 |
+| `src/bridge/extensions.mjs` | **扩展**：读编辑器的扩展库与已载入扩展的方言（`runtime._blockInfo`），并载入一个扩展。方言是"问编辑器"得到的，不是写死的表（见 `docs/gandi-spike.md` 第 21 条） |
 | `src/scratch/xml-parse.mjs` | 够用的 XML 解析器（含 `escapeXml`） |
 | `src/scratch/xml.mjs` | 编译器、反编译器、自定义积木展开、注释收集、孤儿清理、**方言校验**（下拉 shadow / 输入名 / mutation 规范化） |
 | `src/scratch/menus.mjs` | **生成文件**：编辑器自己的积木输入与下拉 shadow 表。改 `tools/gen-block-table.mjs`，别手改 |
@@ -38,8 +38,8 @@
 | `src/scratch/verify.mjs` | 加载前自检：opcode 会不会被当成扩展、mutation 少没少字段、下拉 shadow 对不对、引用悬没悬空、素材在不在 |
 | `src/scratch/merge.mjs` | 把另一个工程的角色（含私有变量/造型/音效与素材字节）并进来 |
 | `src/scratch/zip.mjs` / `wav.mjs` / `svg.mjs` / `keys.mjs` | 手写的小工具 |
-| `test/` | 213 项单元测试，全部离线可跑 |
-| `tools/e2e.mjs` | 验收测试：走真实工具面驱动真编辑器（97 项断言） |
+| `test/` | 231 项单元测试，全部离线可跑 |
+| `tools/e2e.mjs` | 验收测试：走真实工具面驱动真编辑器（127 处 `check`/`skip`；`--front` 打开"用户看不看得见"那几条，其余情况会明确 `[SKIP]`） |
 | `tools/cleanup-editor.mjs` | 把编辑器恢复到确定的基准（**会先备份**） |
 | `tools/spike-gandi-blocks.mjs` | 把编辑器工具箱的 flyout dump 成 `.spike/blocks.json`（积木输入 + 下拉 shadow 的唯一可信来源） |
 | `tools/gen-block-table.mjs` | 用上面的 dump 重新生成 `src/scratch/menus.mjs` |
@@ -62,6 +62,12 @@ node tools/spike-procedures.mjs              # 例：问编辑器"自定义积�
 node tools/spike-gandi-blocks.mjs            # 问编辑器"每个积木的输入和下拉 shadow 叫什么"（要编辑器）
 node tools/gen-block-table.mjs               # 用上面的 dump 重新生成 src/scratch/menus.mjs（离线）
 node tools/spike-gandi-step-rate.mjs         # 问编辑器"谁在推进运行时、每秒几次"（要编辑器）
+node tools/spike-gandi-surface.mjs           # 问窗口"现在屏幕上是谁、怎么切、怎么关"（要编辑器，见下）
+node tools/spike-gandi-extensions.mjs        # 问编辑器"扩展怎么载入、库里有什么"（要编辑器）
+node tools/spike-gandi-extension-project.mjs # 问编辑器"含扩展积木的工程打得开吗、存出来什么样"（会临时换掉工程再还原）
+node tools/spike-gandi-extension-dialect.mjs music pen   # 跑一遍插件自己的扩展读取器（src/bridge/extensions.mjs）
+node tools/spike-gandi-extension-batch.mjs   # 把整个库逐个载入（默认跳过设备类，见"扩展积木"那条陷阱）
+node tools/spike-gandi-extension-write.mjs   # 挑一批不同扩展，真的写积木 → 跑 → 读回（会换掉工程再还原）
 ```
 
 装到 profile 里：
@@ -84,8 +90,8 @@ dsh --profile <p> --dump-config | Select-String gandi    # 确认真的装上了
    - `engineToFragment`：读运行中的编辑器用（反编译器吃线形式）。
    - 纯影子的约定是 **`block === shadow`（同一个 id）**。漏了这条，原语会变成 `[2, id]`
      并永久留在积木表里。
-   走错方向的症状是**静默的**：反编译出空脚本，看起来像"这个角色没积木"。
-   `test/engine-roundtrip.test.mjs` 守着双向相等。
+     走错方向的症状是**静默的**：反编译出空脚本，看起来像"这个角色没积木"。
+     `test/engine-roundtrip.test.mjs` 守着双向相等。
 
 2. **编译 ↔ 反编译必须闭环。** `compileScripts(decompileScripts(f))` 要与 `f` 深度相等
    （含自定义积木、注释、字段 id、mutation）。这是"读出 → 改 → 写回"能成立的全部依据。
@@ -150,9 +156,19 @@ dsh --profile <p> --dump-config | Select-String gandi    # 确认真的装上了
 | `greenFlag()` | 会先 `stopAll()` 并 `resetKeyPressedCache()`——**绿旗之前投的按键会被清掉** |
 | 舞台造型 | `scratch-parser` 拒绝"舞台一个造型都没有"的项目（`should NOT have fewer than 1 items`），所以空白项目必须带一张背景 |
 | `targets[].broadcasts` | sb3 里值是**裸字符串**（`{id: name}`），而 `variables`/`lists` 是 `[name, value]` |
-| 编辑器页签的 URL | 刚开出来的页签在 `/json/list` 里 **`url` 是空字符串**，要等导航提交才有值——所以"等页签出现"必须能按 **target id** 匹配，只按 URL 会白等满超时 |
+| 编辑器页签的 URL | 刚开出来的页签在 `/json/list` 里 **`url` 是空字符串**，要等导航提交才有值。修法是等 URL 里的 `tabId`，**不是**等 target id——两者不是一个命名空间（见下一条） |
+| **`tabId` ≠ CDP target id** | 我们给 shell 的 `tabId` 只出现在页面 URL 里（`?tabId=…`），target 有自己的十六进制 id。曾经以为两者相同，于是"按 target id 等页签"永远落空、再兜底到"任意编辑器页签"——**同时有两个编辑器视图时就会接到别人身上**。取 id 一律 `editorTabIdOf(url)` |
+| **`ViewPreload` 的写操作要传对象** | `switchView({tabId})`、`beforeSwitchView({tabId})`、`removeView({tabId})` 才有效；传裸字符串它们 resolve 成 `undefined` 且什么都不做（"removeView 是主→渲染通知"就是这么误判出来的）。切视图要 `beforeSwitchView` **和** `switchView` 成对调，并且**用可见性读回来确认** |
+| **`addView` 造的视图没有标签** | 标签栏只登记 shell 自己发起的"新建/打开作品"。所以那个视图一旦被主页盖住就点不回来——只能靠 `switchView` 切回最前（或重建）。`addView` 本身**一定把新视图放在最前**，且**不抢桌面焦点** |
+| **`document.visibilityState` 是逐视图的** | 窗口在屏幕上时只有**当前视图**读 `visible`（其余含主页读 `hidden`）；窗口被别的窗口挡住时**全部**读 `hidden`。所以"编辑器 hidden + shell visible"= 用户在看着 Gandi 但看的不是我们的编辑器。这是判断"用户看不看得见"的唯一可信信号 |
+| **`Target.closeTarget` 关视图会把 Gandi 弄死** | 实测两次：关掉后几秒内 App 退出，或下一次 `addView` 直接 `DevTools connection errored`。想关视图只能用 App 自己的 `removeView({tabId})`。`cdp.mjs` 里那条 `closeTarget` 已经删掉，别再加回来 |
+| **重复的 `tabId` 也会把 Gandi 弄死** | 拿一个已存在的 `tabId` 去 `addView`：先多出一个 `error.html` 视图，之后 App 倒。`openEditorTab` 会同时查 target id 与 URL 里的 `tabId` 两个命名空间来避让 |
+| **`Page.bringToFront` 不能用** | 它把整个**窗口**抬到前台（抢用户焦点），却**不切换窗口内部的视图**：用户明确要求"绝不抢焦点"，所以插件一次都不调 |
+| **不带 `--remote-debugging-port` 启动的 Gandi 永远连不上** | DevTools 服务只在浏览器进程启动时创建，运行期没有开关能补。用户自己的快捷方式（桌面/开始菜单）实测 **args 是空的**，所以"接管用户开着的那个"只能靠 `launcher.mjs` 造一个带开关的快捷方式。关它只有 `CloseMainWindow()`（等于点 ✕，App 能问要不要保存），**绝不 taskkill** |
 | `document.hidden` | 页面里 `runtime._step()` 无论如何都会推进，但 `draw()` 被 `!document.hidden` 挡着（后台窗口拿不到帧）。截图要自己 `dirty = true` + `draw()`，别等应用循环 |
 | 页面定时器 | 后台窗口的 `setTimeout` 会被节流到分钟级。页面源码里**不要**用定时器等待，等待放在 Node 侧 |
+| **扩展积木不在工程里，在运行时里** | 一个 `music_*` 积木的 opcode、输入名、下拉 shadow 只存在于 `runtime._blockInfo`，**载入扩展之后**才有。所以方言不能写死成表，只能问编辑器（`src/bridge/extensions.mjs`）。载入入口是 `extensionManager.loadExtensionURL(id)`：内置的走 `loadExtensionIdSync`（13 个，不联网），其余的它自己去 `ccwAPI.getExtensionURLById` 要地址。`_blockInfo` 里 `info.opcode` **不带**前缀（`restForBeats`），写进工程**带**前缀（`music_restForBeats`）；`info.arguments` 是**对象**不是数组；菜单 shadow 的 opcode 抄菜单项里生成好的 JSON 的 `type` 字段（自己拼会得到 `music_menu_` 这种空名），字段名也在那份 JSON 里（`music_menu_DRUM` → `DRUM`，但 `pen_menu_colorParam` → `colorParam`）。工程能打开靠的是 **opcode 前缀**，`extensions` 数组只是记录（实测：把数组删掉照样打开）。详见 `docs/gandi-spike.md` 第 21 条 |
+| **载入"设备类"扩展会打开摄像头/麦克风** | 摄像机/语音类扩展（`GandiKamera`、`faceSensing`、`GandiMedia`、`GandiSpineSkeleton`、`Gandi4DPocket`、`GandiDolly`、`witCat.dollyPro`、`sipc.ink.Recording`…）**只要被载入**就会打开设备——不需要用它的积木——而且**编辑器不会关**（Windows 摄像头记录里 Gandi 是 `lastUsedStop=0`，一直到关掉 App 才写回）。一次"把 89 个扩展全载入"的探针就这么把用户的摄像头留开了。插件现在载入后扫活的 `MediaStreamTrack`、`stop()` 并把结果写进输出；`list` 给这些 id 打 `[uses a device]`；`spike-gandi-extension-batch.mjs` **默认跳过**它们（要 `--devices`）。这是"绝不抢焦点"的同一类原则：动用户的设备之前先把代价说清楚 |
 
 ## 工作方式：先问，别猜
 
@@ -200,10 +216,17 @@ dsh --profile <p> --dump-config | Select-String gandi    # 确认真的装上了
   `dsh plugin --profile <p> <args>` 只是把参数**转发给 profile 目录里的 pnpm**
   （`lib/bin.js:116`，`add` / `remove` / `why` …），**DSH 没有独立的插件市场**——
   所以别在文档或话术里承诺"上架"之类的事。
-- **不做 Gandi 插件**（那种在"插件设置"里填 URL 加载的 JS），也不做 Gandi 扩展积木，
-  更不改 Gandi 的界面。本项目是从外面通过 CDP 驱动编辑器。
+- **不做 Gandi 插件**（那种在"插件设置"里填 URL 加载的 JS），也不改 Gandi 的界面或代码。
+  本项目是从外面通过 CDP 驱动编辑器。
   顺带记一条：Gandi 的**在线**编辑器确实是靠 `window.Scratch.plugins.register` 注入插件的，
   但那条路要用户自己点开设置填 URL，不是插件该走的路。
+- **扩展积木做了，而且是整个库**（`gandi_extension`，见上表最后两行与 `docs/gandi-spike.md` 第 21 条）：
+  89 个未禁用扩展里 88 个实测能载入并给出可读方言（`whiteBoard` 是编辑器自己载不动）。
+  但**只走编辑器自己的载入路径**：不替用户改编辑器配置、不注入脚本、不绕过它
+  `loadExtensionURL` 的判断。载入是"用户点添加扩展"的同一件事，所以工具箱里会真的出现那个类别。
+  载入状态按页签算（换作品要重载），而且不会因为"载入了"就写进工程——只有用了它的积木才会。
+  **载入设备类扩展会开摄像头/麦克风**（见上表）：插件会关掉并报告，但把库整个跑一遍时
+  要自己注意——探针默认已跳过这些 id。
 - **`gandi_merge` 不并舞台的背景**：它按角色名并角色的脚本、私有变量/列表、造型/音效与素材；
   舞台的 `costumes`/`sounds` 保持目标工程的样子（舞台归主控，这是那个范式的约定）。
   全局变量/列表/广播按 id **取并集**，不覆盖。
@@ -218,3 +241,10 @@ dsh --profile <p> --dump-config | Select-String gandi    # 确认真的装上了
   `gandi_new` 会带一个起始角色的原因。
 - **不碰用户的云端作品**：Gandi 的编辑器是在线作品，插件只把项目导出到本地 `.sb3`，
   不会替用户保存/发布云端版本。
+- **绝不抢窗口焦点**：Gandi 在别的窗口后面时什么都不做（不 `bringToFront`、不置顶、不重排视图），
+  只把状态写进 `gandi_status`。看不到进度是用户显式选的，不是没做。
+- **插件开的编辑器视图没有标签**（Gandi 只给"它自己发起的"作品流程加标签），所以"点标签切回来"
+  这条路不存在；插件靠 `switchView` 切回最前，实在切不动才重建视图（会丢 undo 历史，
+  所以下一次工具结果里必须带 NOTE 说明）。
+- **接管不了一个没带调试端口的 Gandi**（Chromium 限制）。插件的答案是把带开关的快捷方式
+  交给用户（`launcher.mjs`），而不是替他关掉那个窗口——除非他明确说 `restart: true`。

@@ -205,8 +205,8 @@ export const collectScript = (blocks, rootId) => {
  * `applyFragment`, which does the same thing against a live runtime.
  *
  * @param {any} project parsed project document (mutated in place)
- * @param {{target?: string, fragment: {blocks: Record<string, any>, topLevelIds: string[], variables?: any[]}, mode?: 'replace'|'append'|'replaceScript', script?: number|string, scope?: 'global'|'local'}} request the edit
- * @returns {{target: string, removedBlocks: number, createdBlocks: number, declaredVariables: string[], blocksAfter: number}} what changed
+ * @param {{target?: string, fragment: {blocks: Record<string, any>, topLevelIds: string[], variables?: any[]}, mode?: 'replace'|'append'|'replaceScript', script?: number|string, scope?: 'global'|'local', extensions?: Iterable<string>}} request the edit
+ * @returns {{target: string, removedBlocks: number, createdBlocks: number, declaredVariables: string[], blocksAfter: number, extensionsAdded: string[]}} what changed
  * @throws {ProjectError} when the target does not exist, or the named script does not
  */
 export const applyFragmentToProject = (project, request) => {
@@ -297,6 +297,19 @@ export const applyFragmentToProject = (project, request) => {
   }
   target.comments = comments
 
+  // The document's extension list is how every other Scratch tool learns which
+  // extensions the project uses. The editor itself does not need it — it loads from the
+  // opcode prefix — but a project that uses `music_*` blocks and declares nothing is a
+  // project whose next reader has to guess. Union, never replace: the list belongs to
+  // the whole project, and this edit only knows about its own blocks.
+  const extensionsAdded = []
+  if (request.extensions !== undefined) {
+    const existing = Array.isArray(project.extensions) ? project.extensions : []
+    const ids = [...new Set([...existing, ...[...request.extensions].map((id) => String(id))])]
+    for (const id of ids) if (!existing.includes(id)) extensionsAdded.push(id)
+    project.extensions = ids
+  }
+
   return {
     target: target.name,
     removedBlocks,
@@ -304,6 +317,7 @@ export const applyFragmentToProject = (project, request) => {
     declaredVariables,
     createdComments,
     removedComments,
-    blocksAfter: Object.keys(blocks).length
+    blocksAfter: Object.keys(blocks).length,
+    extensionsAdded
   }
 }

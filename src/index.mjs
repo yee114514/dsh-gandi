@@ -30,10 +30,12 @@ import { applyFragmentToProject, findProjectTarget, summarizeProject, targetXmlF
 import { formatMerge, mergeProjects } from './scratch/merge.mjs'
 import { formatReport, verifyProject } from './scratch/verify.mjs'
 import { SAMPLE_RATE, encodeWav, synthesizeTone } from './scratch/wav.mjs'
-import { compileScripts, proceduresFromBlocks, randomBlockId } from './scratch/xml.mjs'
+import { compileScripts, extensionsOfFragment, proceduresFromBlocks, randomBlockId } from './scratch/xml.mjs'
+import { CORE_OPCODES } from './scratch/menus.mjs'
 import { fragmentToEngine } from './scratch/engine.mjs'
 import { assertLooksLikeSvg, defaultRotationCenter } from './scratch/svg.mjs'
 import { isPostableKey, knownKeyNames, toDomKey } from './scratch/keys.mjs'
+import { extensionFacts, formatExtensionCatalogue, formatExtensionDialect, loadExtension } from './bridge/extensions.mjs'
 import {
   addCostume,
   addSound,
@@ -58,10 +60,11 @@ import {
   selectTarget,
   setTargetState,
   stopAll,
-  stripSprite,
-  waitForVm
+  stripSprite
 } from './bridge/ops.mjs'
-import { DEFAULT_PORT, attach, launchAndAttach, probeTargets, rememberAppPath, resolveAppPath } from './bridge/app.mjs'
+import { DEFAULT_PORT, resolveAppPath } from './bridge/app.mjs'
+import { createLauncher, launcherExists, launcherPath, patchGandiShortcuts } from './bridge/launcher.mjs'
+import { SurfaceState } from './bridge/surface.mjs'
 import { BridgeService } from './plugin/service.mjs'
 
 /** Cordis plugin name, used by loader diagnostics. */
@@ -101,6 +104,9 @@ const resolveConfig = (config = {}) => {
       : (envAuto === undefined ? false : envAuto === '1' || envAuto === 'true'),
     leaseIdleMs: Number.isInteger(config.leaseIdleMs) && config.leaseIdleMs > 0 ? config.leaseIdleMs : 60000,
     launchTimeoutMs: Number.isInteger(config.launchTimeoutMs) && config.launchTimeoutMs > 0 ? config.launchTimeoutMs : 45000,
+    // Only the EXPENSIVE "re-create the editor view" path is rate-limited by this: switching
+    // a view costs nothing, so it is never suppressed. 0 disables the limit.
+    recreateCooldownMs: Number.isInteger(config.recreateCooldownMs) && config.recreateCooldownMs >= 0 ? config.recreateCooldownMs : 30000,
     maxTextChars: Number.isInteger(config.maxTextChars) && config.maxTextChars > 0 ? config.maxTextChars : 20000,
     screenshotOnRun: config.screenshotOnRun !== false,
     allowOutsideWorkspace: config.allowOutsideWorkspace === true,
@@ -212,6 +218,32 @@ export function apply (ctx, rowConfig = {}) {
   const clamp = (text) => text.length <= config.maxTextChars
     ? text
     : `${text.slice(0, config.maxTextChars)}\n… truncated ${text.length - config.maxTextChars} characters (raise maxTextChars in the plugin config for more)`
+
+  /**
+   * One line about whether the user can see the editor the bridge drives.
+   *
+   * This is the answer to "the model says it is working, but I only see the home page":
+   * Gandi's window, its home page and every editor are separate views, and only one of
+   * them is on screen at a time.
+   *
+   * @param {any} surface the reading from the service
+   * @returns {string} a sentence for the tool output
+   */
+  const describeSurface = (surface) => {
+    if (surface === null || surface === undefined) return 'not read yet'
+    switch (surface.state) {
+      case SurfaceState.ON_SCREEN:
+        return 'the editor view the bridge drives is the one on screen'
+      case SurfaceState.BEHIND_GANDI_VIEWS:
+        return 'another Gandi view (the home page, or one of the user\'s own projects) is in front of the editor — the next edit will put the editor back in front'
+      case SurfaceState.WINDOW_BEHIND:
+        return 'the Gandi window itself is behind another window, so the user cannot see it right now (the bridge never steals focus to change that)'
+      case SurfaceState.NO_EDITOR:
+        return 'no editor view is open yet'
+      default:
+        return 'unknown (the Gandi window could not be read)'
+    }
+  }
 
   /**
    * Render a Scratch value the way Scratch shows it.
@@ -375,6 +407,102 @@ export function apply (ctx, rowConfig = {}) {
   const writeAccess = (args, sessionId) => ({ sessionId, mutating: true, force: args?.force === true })
 
   /**
+   * Extension facts, cached for a few seconds. ONE cache slot, keyed by nothing: there
+   * is one editor per process, and the answer goes stale only when someone loads an
+   * extension — which is exactly what the caller of this helper is often about to do.
+   * A wrong-but-recent answer would mean "unknown extension" for an extension that was
+   * just loaded, so the TTL is short and every caller that LOADS clears it by writing
+   * the new facts back.
+   * @type {{at: number, facts: any}|null}
+   */
+  let extensionCache = null
+  const EXTENSION_CACHE_MS = 15000
+
+  /**
+   * The editor's extension facts, or null when there is no editor to ask.
+   *
+   * Soft-probed on purpose: `gandi_apply` and `gandi_verify` must keep working with the
+   * editor closed (that is the whole offline half of this plugin), and a project with no
+   * extension blocks must not pay for a CDP round trip at all. Callers use this only
+   * after they already know extension blocks are involved.
+   *
+   * @param {string} sessionId the calling session
+   * @param {{fresh?: boolean}} [options] bypass the cache
+   * @returns {Promise<any|null>} the facts, or null when the editor cannot be reached
+   */
+  const probeExtensions = async (sessionId, options = {}) => {
+    if (options.fresh !== true && extensionCache !== null && Date.now() - extensionCache.at < EXTENSION_CACHE_MS) {
+      return extensionCache.facts
+    }
+    try {
+      const facts = await service.use({ sessionId, mutating: false }, (connection) => extensionFacts(connection))
+      extensionCache = { at: Date.now(), facts }
+      return facts
+    } catch {
+      // No editor, no editor tab, or a page that has no extension manager: all three are
+      // "cannot ask", and none of them is a reason to fail the call.
+      return null
+    }
+  }
+
+  /**
+   * The extension ids this editor is known to offer. `gandi_verify` uses it to tell "an
+   * opcode nobody can load" from "an extension block from something Gandi can load" —
+   * the editor's catalogue has 93 ids on 1.0.5, most of them community extensions no
+   * static list would have.
+   * @param {string} sessionId the calling session
+   * @returns {Promise<string[]>} known ids (empty when there is no editor)
+   */
+  const knownExtensionIds = async (sessionId) => {
+    const facts = await probeExtensions(sessionId)
+    if (facts === null || facts.available !== true) return []
+    return [...(facts.catalogueIds ?? []), ...(facts.builtinIds ?? [])]
+  }
+
+  /**
+   * Whether the XML mentions any block that is not a core one.
+   *
+   * A cheap pre-check so that an ordinary script never costs a CDP round trip: every
+   * core block type is in the generated table, so one unknown `type=` attribute is the
+   * signal that extensions may be involved. The answer being wrong in the "yes"
+   * direction only costs one query.
+   *
+   * @param {string} xml the script XML
+   * @returns {boolean} true when some block type is not a core opcode
+   */
+  const mentionsNonCoreBlock = (xml) => {
+    for (const match of xml.matchAll(/type="([^"]+)"/g)) {
+      if (!CORE_OPCODES.has(match[1])) return true
+    }
+    return false
+  }
+
+  /**
+   * What to tell an author whose script needs an extension the editor does not have.
+   * @param {string[]} missing the extension ids the XML needs
+   * @param {any|null} facts what the editor said, when it answered
+   * @returns {string} a sentence naming the fix
+   */
+  const extensionHint = (missing, facts) => {
+    const loadable = facts === null ? [] : (facts.catalogueIds ?? [])
+    const builtin = facts === null ? [] : (facts.builtinIds ?? [])
+    const lines = [`this script uses the extension(s) ${missing.join(', ')}, which ${missing.length === 1 ? 'is' : 'are'} not loaded in this editor`]
+    const canLoad = missing.filter((id) => loadable.includes(id) || builtin.includes(id))
+    if (canLoad.length > 0) {
+      lines.push(`load ${canLoad.length === 1 ? 'it' : 'them'} first: gandi_extension {action: "load", id: "${canLoad[0]}"}`)
+    }
+    if (facts === null) {
+      lines.push('no editor answered, so this cannot be checked: pass `path` to edit a file offline (extension blocks are then written as named), or open an editor with gandi_launch')
+    } else {
+      const unknown = missing.filter((id) => !canLoad.includes(id))
+      if (unknown.length > 0) {
+        lines.push(`this editor does not offer ${unknown.join(', ')} — gandi_extension {action: "list"} prints every id it does (${loadable.length} of them)`)
+      }
+    }
+    return lines.join('. ')
+  }
+
+  /**
    * Register one tool. `mutating` tools take the project lease and are serialised
    * against every other tool in this process.
    * @param {{name: string, description: string, parameters: any, schema?: any, mutating?: boolean, concurrencySafe?: boolean, run: (args: any, exec: any, sessionId: string) => Promise<any>}} definition tool definition
@@ -402,7 +530,15 @@ export function apply (ctx, rowConfig = {}) {
       async execute (args, exec) {
         const sessionId = sessionOf(exec)
         try {
-          return await definition.run(args ?? {}, exec, sessionId)
+          const value = await definition.run(args ?? {}, exec, sessionId)
+          // A note about the user's screen rides the NEXT result: when the editor had to
+          // be re-created in front, the person reading this is the one who needs to know
+          // (their undo history went with the old view).
+          const note = service.takeSurfaceNote()
+          if (note !== null && value !== null && typeof value === 'object' && typeof value.text === 'string') {
+            return { ...value, text: `${value.text}\n${note}` }
+          }
+          return value
         } catch (error) {
           rethrowReadable(error)
         }
@@ -425,11 +561,14 @@ export function apply (ctx, rowConfig = {}) {
       const status = await service.status()
       const lines = [
         `port ${status.port}: ${status.portOpen ? 'open' : 'closed'}`,
-        `editor tab: ${status.editorOpen ? 'open' : 'none'}`,
+        `editor tab: ${status.editorOpen ? `open${status.editorTabId === null ? '' : ` (${status.editorTabId})`}` : 'none'}`,
         `connection: ${status.connected ? 'attached' : 'not attached'}`,
-        `Gandi process: ${status.processRunning ? 'running' : 'not running'}`,
+        `editor on screen: ${describeSurface(status.surface)}`,
+        `Gandi process: ${status.processRunning ? `running${status.processCount === null ? '' : ` (${status.processCount} process(es))`}` : 'not running'}`,
+        `attachable endpoint: ${status.attachable === null ? 'none' : `port ${status.attachable.port} (${status.attachable.source})`}`,
         `app path: ${status.appPath ?? '(not found — set appPath or GANDI_APP_PATH)'}`,
         `auto-launch: ${status.autoLaunch ? 'on' : 'off'}`,
+        `attachable launcher: ${status.launcher.exists ? status.launcher.path : `not created yet (${status.launcher.path}; gandi_launch {launcher: true} makes it)`}`,
         `workspace: ${cwdOf(exec)}`,
         `lease: ${status.lease === null ? 'free' : `held by session ${status.lease.sessionId} (idle ${Math.round(status.lease.idleMs / 1000)}s of ${Math.round(status.leaseIdleMs / 1000)}s)`}`,
         `this session: ${sessionId}`,
@@ -444,7 +583,11 @@ export function apply (ctx, rowConfig = {}) {
           // no editor tab. Nothing is broken; one call opens one.
           lines.push('NOTE: Gandi is on the debug port but has no editor tab open. Call gandi_launch (or any other gandi_* tool) and one will be opened.')
         } else if (status.processRunning) {
-          lines.push('NOTE: Gandi is running without a debug port. Close it, then call gandi_launch so the plugin can attach to the editor it opens.')
+          lines.push(
+            'NOTE: Gandi is running but was NOT started with --remote-debugging-port, and a running Gandi cannot be made attachable. ' +
+            'It is still open: nothing was closed. Open Gandi from the attachable launcher instead, or ask the user and then call ' +
+            'gandi_launch {restart: true} to close that window and start an attachable one.'
+          )
         } else {
           lines.push('NOTE: call gandi_launch to start Gandi and open an editor tab, or gandi_open to work with a .sb3 file without the editor.')
         }
@@ -513,7 +656,9 @@ export function apply (ctx, rowConfig = {}) {
       'fields the editor dereferences, a dropdown shadow that is not the one the block expects, a field naming a',
       'variable nothing declares, an asset the archive does not contain.',
       'Pass live: true to go further and hand the file to the editor\'s own deserializer, restoring whatever was',
-      'open afterwards — the definitive answer, and the only check that can be wrong in neither direction.'
+      'open afterwards — the definitive answer, and the only check that can be wrong in neither direction.',
+      'Extension blocks are judged against what the editor actually offers: a block from a loadable extension is',
+      'reported as a note, not as an unknown opcode, and a project that declares an extension nothing can load is a warning.'
     ].join(' '),
     parameters: {
       type: 'object',
@@ -528,10 +673,19 @@ export function apply (ctx, rowConfig = {}) {
     async run (args, exec, sessionId) {
       const absolute = resolveProjectPath(requireString(args.path, 'path'), exec)
       const { project, assets, warnings: containerWarnings } = await readProjectFile(absolute)
-      const report = verifyProject(project, { assets })
+      // What this editor can load, when there is one. Without it the check falls back to
+      // the short built-in list, which is enough to say "this is an extension block"
+      // for the standard ones and nothing at all for the 90-odd Gandi-only ids.
+      const knownExtensions = await knownExtensionIds(sessionId)
+      const report = verifyProject(project, { assets, knownExtensions })
       for (const warning of containerWarnings) report.warnings.push(`archive: ${warning}`)
 
       const lines = [`checked ${absolute}`, formatReport(report, { heading: 'offline load check' })]
+      if (knownExtensions.length > 0) {
+        lines.push(`(extension blocks were judged against the ${knownExtensions.length} extension id(s) this editor offers)`)
+      } else {
+        lines.push('(no editor answered, so extension blocks were judged against the standard Scratch extension names only)')
+      }
       if (args.live !== true) {
         if (report.errors.length > 0) {
           lines.push('This file would fail to load. Fix the errors above, or pass live: true to confirm against the editor itself.')
@@ -575,18 +729,124 @@ export function apply (ctx, rowConfig = {}) {
     }
   })
 
+  // ── extensions ────────────────────────────────────────────────────────────
+
+  registerTool({
+    name: 'gandi_extension',
+    mutating: true,
+    description: [
+      'Extensions: the block categories a project adds from Gandi\'s 添加扩展 library — music, pen, video sensing,',
+      'text-to-speech, and Gandi\'s own (CCW3D, GandiAIHub, box2d, …). An extension\'s blocks only exist once it is',
+      'LOADED into the running editor, so this tool is both the catalogue and the loader.',
+      'action "list" (default) prints what this editor offers and what is already loaded, including each loaded',
+      'extension\'s blocks, their inputs and their dropdown shadow types — the dialect gandi_apply accepts.',
+      'action "load" loads one by id (the same call the 添加扩展 button makes) and prints its dialect, which is what',
+      'makes those blocks writable. Loading also puts the category in the toolbox, so the user can drag the blocks too.',
+      'Loading changes editor state but never the project: a project only records an extension once a block of it is used.',
+      'A device-backed extension (camera/microphone — GandiKamera, faceSensing, videoSensing, …) starts that device the',
+      'moment it loads; "list" marks those with [uses a device], and the load result says what was opened and that it was',
+      'stopped again. There is nothing to confirm: loading is the user\'s own action, and the device is released afterwards.'
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'load'], description: 'list (default) reports; load brings one in.' },
+        id: { type: 'string', description: 'With action "load": the extension id, e.g. "music", "pen", "text2speech". gandi_extension {action:"list"} prints every id this editor offers.' },
+        filter: { type: 'string', description: 'With action "list": only ids containing this text.' },
+        limit: { type: 'number', description: 'With action "list": how many rows to print (default 200).' },
+        dialect: { type: 'boolean', description: 'With action "list": also print the full block dialect of every loaded extension (default true).' }
+      },
+      additionalProperties: false
+    },
+    async run (args, exec, sessionId) {
+      const action = args.action === 'load' ? 'load' : 'list'
+
+      if (action === 'load') {
+        const id = requireString(args.id, 'id')
+        const outcome = await service.use(writeAccess(args, sessionId), async (connection) => {
+          const loaded = await loadExtension(connection, id)
+          // Read the editor's state back in the SAME visit: every caller of this tool is
+          // about to write blocks for the extension it just loaded, and a cached "not
+          // loaded" would refuse them. One extra query is cheaper than that failure.
+          let facts = null
+          try {
+            facts = await extensionFacts(connection)
+          } catch {
+            facts = null
+          }
+          return { loaded, facts }
+        })
+        extensionCache = outcome.facts === null ? null : { at: Date.now(), facts: outcome.facts }
+        const result = outcome.loaded
+        const stopped = result.mediaStopped ?? []
+        const lines = [
+          result.alreadyLoaded
+            ? `${id} was already loaded in this editor`
+            : `loaded ${id} into the editor in ${result.ms}ms`,
+          `loaded extensions now: ${result.loadedIds.join(', ') || 'none'}`,
+          'the category is now in the toolbox, so the user can drag these blocks too',
+          // Loading a device-backed extension opens the device — the editor does it by
+          // itself, and nothing closes it again. Say so, and say that it was closed here:
+          // a camera light appearing because a tool ran is exactly the kind of thing the
+          // user has to be told about, not discover.
+          ...(stopped.length > 0
+            ? [`NOTE: this extension is DEVICE-backed. Loading it opened ${stopped.map((track) => track.kind).join(' + ')} ` +
+               `(${stopped.map((track) => track.label || track.where).join(', ')}) — the editor starts it just by being loaded, ` +
+               'and would have left it on. It has been STOPPED again, so your camera/microphone is not left running.']
+            : []),
+          '',
+          formatExtensionDialect(result.extension)
+        ]
+        return { text: clamp(lines.join('\n')) }
+      }
+
+      const facts = await probeExtensions(sessionId, { fresh: true })
+      if (facts === null) {
+        throw new Error(`no editor answered on port ${config.port}, so its extension catalogue cannot be read. ` +
+          'Extensions are the editor\'s own list (they are fetched from Gandi when loaded), so there is nothing to ' +
+          'report without one: call gandi_launch, or gandi_status to see why the editor is not reachable.')
+      }
+      const lines = [
+        formatExtensionCatalogue(facts, { filter: args.filter, limit: args.limit }),
+        '',
+        'loading one: gandi_extension {action: "load", id: "music"} — then write its blocks with gandi_apply, using the',
+        'block types and dropdown shadows printed below. The project records the extension itself once a block is used.'
+      ]
+      if (args.dialect !== false && (facts.loaded ?? []).length > 0) {
+        for (const extension of facts.loaded) {
+          lines.push('', formatExtensionDialect(extension))
+        }
+        if ((facts.loaded ?? []).some((extension) => (extension.skippedBlocks ?? 0) > 0)) {
+          lines.push('', '(a block with no opcode — Gandi\'s pen extension registers one — is left out: it cannot be written)')
+        }
+      }
+      return { text: clamp(lines.join('\n')) }
+    }
+  })
+
   // ── launch ────────────────────────────────────────────────────────────────
 
   registerTool({
     name: 'gandi_launch',
     mutating: true,
     schema: LAUNCH_OUTPUT,
-    description: 'Start Gandi Desktop with a debug port, open an editor tab and attach to it. If Gandi is already running without a debug port it must be restarted through this tool.',
+    description: [
+      'Get Gandi Desktop ready to be driven: adopt the one that is already open, or start one, and open an editor tab the user can watch.',
+      'A Gandi that is already running on a debug port is ALWAYS reused, whatever port it answers on — this never starts a second window.',
+      'A Gandi running WITHOUT a debug port can never be attached to (the debug server only exists if the switch was there at start-up),',
+      'and this NEVER closes it: it fails with the two ways forward instead. Pass restart: true to close that window (politely — the app',
+      'may ask about unsaved work) and start an attachable Gandi. Pass launcher: true to create a shortcut that starts Gandi WITH the',
+      'switch, so the Gandi the user opens themselves can be adopted from then on; patchShortcuts: true additionally rewrites the',
+      'arguments of the Gandi shortcuts that already exist (each one is reported, with its previous arguments).'
+    ].join(' '),
     parameters: {
       type: 'object',
       properties: {
         appPath: { type: 'string', description: 'Absolute path to Gandi.exe; defaults to the configured path or a discovered install.' },
-        timeoutMs: { type: 'number', description: 'How long to wait for the editor to load (default 45000).' }
+        timeoutMs: { type: 'number', description: 'How long to wait for the editor to load (default 45000).' },
+        restart: { type: 'boolean', description: 'Close a running Gandi that cannot be attached to, then start an attachable one. Ask the user first: unsaved work lives only in that window.' },
+        launcher: { type: 'boolean', description: 'Create/refresh a Start Menu shortcut that starts Gandi with the debug port, so a Gandi the user opens themselves can be reused.' },
+        patchShortcuts: { type: 'boolean', description: 'Also add the debug port to the arguments of the Gandi shortcuts that already exist (reported in full, reversible by hand).' }
       },
       additionalProperties: false
     },
@@ -594,37 +854,58 @@ export function apply (ctx, rowConfig = {}) {
       const requested = typeof args.appPath === 'string' && args.appPath.length > 0 ? args.appPath : config.appPath
       const appPath = resolveAppPath(requested)
       const timeoutMs = Number.isFinite(args.timeoutMs) ? Number(args.timeoutMs) : config.launchTimeoutMs
+      const lines = []
 
-      // Already listening? Attach instead of starting a second copy. Unlike TurboWarp
-      // there is no single-instance lock to fight, but spawning a second Gandi would
-      // still leave the user with two windows, and the one already open is the one
-      // they can see. If it has no editor tab, `attach` asks its shell for one.
-      const listening = await probeTargets(config.port, { timeoutMs: 1500 })
-      if (listening.length > 0) {
-        service.dispose()
-        const attached = await attach({ port: config.port, timeoutMs, openTab: true, readyTimeoutMs: timeoutMs })
-        const ready = await waitForVm(attached.connection, { timeoutMs })
-        if (appPath !== null) rememberAppPath(appPath)
+      // An explicit path is honoured as given: quietly substituting a remembered or
+      // discovered executable would make "I set appPath and it still used something
+      // else" impossible to diagnose — and would start the wrong Gandi.
+      if (typeof requested === 'string' && requested.length > 0 && appPath === null) {
+        throw new Error(`no such executable: ${requested}. Fix appPath, or start Gandi yourself with --remote-debugging-port=${config.port}.`)
+      }
+
+      if (args.launcher === true || args.patchShortcuts === true) {
+        if (appPath === null) {
+          throw new Error('no Gandi executable is known, so no launcher can be pointed at one. Pass appPath once, or set appPath / GANDI_APP_PATH.')
+        }
+        if (args.launcher === true) {
+          const made = await createLauncher({ appPath, port: config.port })
+          lines.push(`${made.note}`)
+        }
+        if (args.patchShortcuts === true) {
+          const patched = await patchGandiShortcuts({ port: config.port })
+          if (patched.changed.length === 0 && patched.failed.length === 0) {
+            lines.push(patched.unchanged.length === 0
+              ? 'no Gandi shortcut was found to patch (desktop, Start Menu, taskbar pin)'
+              : `every Gandi shortcut already carries the debug port (${patched.unchanged.length} checked)`)
+          }
+          for (const entry of patched.changed) {
+            lines.push(`patched ${entry.path}\n    was: ${entry.previousArgs.trim().length > 0 ? entry.previousArgs : '(no arguments)'}\n    now: ${entry.args}`)
+          }
+          for (const entry of patched.failed) {
+            lines.push(`could NOT patch ${entry.path}: ${entry.error}`)
+          }
+        }
+        // Creating a launcher is a change to the user's machine, not a launch: say what
+        // was done and stop, so the model reports it instead of quietly starting Gandi.
         return {
-          text: `Gandi was already listening on port ${config.port}; attached to the running editor` +
-            `${attached.opened ? ' (opened a new editor tab)' : ''} (${ready ? 'ready' : 'did not finish loading a project'}).`,
-          appPath: appPath ?? '(already running)',
-          ready
+          text: lines.join('\n'),
+          appPath: appPath ?? '(unknown)',
+          ready: false
         }
       }
 
-      if (appPath === null) {
-        throw new Error(typeof requested === 'string' && requested.length > 0
-          ? `no such executable: ${requested}. Fix appPath, or start Gandi yourself with --remote-debugging-port=${config.port}.`
-          : 'no Gandi executable found. Pass appPath once (it is remembered for later sessions), or set appPath / GANDI_APP_PATH.')
-      }
-      service.dispose()
-      const launched = await launchAndAttach({ appPath, port: config.port, timeoutMs })
-      const ready = await waitForVm(launched.connection, { timeoutMs })
+      const result = await service.launch({ appPath, timeoutMs, restart: args.restart === true })
+      const summary = result.adopted
+        ? `adopted the running Gandi on port ${result.port} (found via ${result.source}) — no new window was started` +
+          `${result.attached.opened ? ', opened an editor tab' : ''}`
+        : `started Gandi from ${appPath} on port ${result.port}${result.closedNote}`
+      const surface = service.lastSurface
+      lines.push(`${summary}; editor ${result.attached.ready ? 'ready' : 'did not finish loading a project'}.`)
+      if (surface !== null) lines.push(`editor view: ${describeSurface(surface)}`)
       return {
-        text: `Gandi started from ${appPath} on port ${config.port}; editor ${ready ? 'ready' : 'did not finish loading a project'}.`,
-        appPath,
-        ready
+        text: lines.join('\n'),
+        appPath: appPath ?? '(already running)',
+        ready: result.attached.ready === true
       }
     }
   })
@@ -864,7 +1145,7 @@ export function apply (ctx, rowConfig = {}) {
         const label = entries.length > 1 ? `costumes[${index}]` : 'costume'
         const hasSvg = typeof entry.svg === 'string' && entry.svg.trim().length > 0
         const hasBase64 = typeof entry.base64 === 'string' && entry.base64.trim().length > 0
-        if (hasSvg === hasBase64) throw new Error(`${label}: pass exactly one of \`svg\` or \`base64\``)
+        if (hasSvg === hasBase64) throw new Error(`${label}: pass exactly one of "svg" or "base64"`)
         const dataFormat = (typeof entry.dataFormat === 'string' && entry.dataFormat.length > 0
           ? entry.dataFormat
           : (hasSvg ? 'svg' : 'png')).toLowerCase()
@@ -1245,6 +1526,14 @@ export function apply (ctx, rowConfig = {}) {
           }
         }
         lines.push(`editing target: ${state.editingTarget?.name ?? '(none)'}`)
+        // Which extensions this editor has loaded decides which block types can be
+        // written at all, so it belongs in the read view rather than only in an error.
+        try {
+          const facts = await extensionFacts(connection)
+          lines.push(`extensions loaded: ${(facts.loadedIds ?? []).join(', ') || 'none'} (of ${(facts.catalogueIds ?? []).length} this editor offers — see gandi_extension)`)
+        } catch {
+          // No extension manager in this page: not worth failing a read over.
+        }
         if (includeXml) {
           const wantedLive = wanted ?? state.editingTarget?.name
           if (wantedLive !== undefined) {
@@ -1338,6 +1627,10 @@ export function apply (ctx, rowConfig = {}) {
       'position in the script list, or its block id); "append" adds alongside what is there.',
       'XML that would produce a project the editor cannot open is REFUSED, not written: a dropdown shadow that is not',
       'the one the block expects, an unknown shadow type, a custom-block call whose arguments cannot be resolved.',
+      'Extension blocks (music_*, pen_*, …) work too, but only once that extension is LOADED in the editor — the block',
+      'type, its inputs and its dropdown shadow exist only there. Load one with gandi_extension {action:"load"} first;',
+      'if it is missing, this says so instead of writing a block that would not resolve. With `path` (no editor)',
+      'extension blocks are written as named and the extension is recorded in the document.',
       'Pass dryRun to compile and check without touching anything — with `path` it also checks the result after applying.'
     ].join(' '),
     parameters: {
@@ -1394,9 +1687,46 @@ export function apply (ctx, rowConfig = {}) {
         }
       }
 
-      const fragment = compileScripts(xml, procedures === undefined ? {} : { procedures })
-      const warnings = fragment.warnings.length === 0 ? '  (none)' : fragment.warnings.map((w) => `  ${w}`).join('\n')
+      // Extension blocks need the extension LOADED before they can be compiled honestly:
+      // the opcode, the input names and the dropdown shadow of a `music_*` block exist
+      // only in the running editor's `_blockInfo`. So when the XML mentions a block that
+      // is not a core opcode, ask the editor what it has — and refuse with a way forward
+      // when the extension it needs is not available. With no editor at all (the offline
+      // half of this tool) the blocks are written as named, which is exactly right for a
+      // file: the editor loads them from the opcode prefix when it opens the project.
+      const mentionsExtensions = mentionsNonCoreBlock(xml)
+      let extensionDialect = []
+      let extensionProbe = null
+      if (mentionsExtensions && offline === null) {
+        extensionProbe = await probeExtensions(sessionId)
+        if (extensionProbe !== null && extensionProbe.available === true) {
+          extensionDialect = extensionProbe.loaded ?? []
+        }
+      }
 
+      let fragment
+      try {
+        fragment = compileScripts(xml, {
+          ...(procedures === undefined ? {} : { procedures }),
+          ...(extensionDialect.length === 0 ? {} : { dialect: extensionDialect })
+        })
+      } catch (error) {
+        // A refused compile is where "you wrote an extension block" and "you misspelled
+        // an opcode" look identical. If the editor answered, the difference can be named.
+        if (extensionProbe !== null) {
+          const needed = (xml.match(/type="([^"]+)"/g) ?? [])
+            .map((match) => match.slice(6, -1).split('_')[0])
+            .filter((prefix) => !CORE_OPCODES.has(prefix))
+          const loadedIds = new Set((extensionProbe.loadedIds ?? []))
+          const missing = [...new Set(needed.filter((id) => !loadedIds.has(id)))]
+          if (missing.length > 0) {
+            throw new Error(`${error.message}\n\n${extensionHint(missing, extensionProbe)}`)
+          }
+        }
+        throw error
+      }
+      const neededExtensions = extensionsOfFragment(fragment)
+      const warnings = fragment.warnings.length === 0 ? '  (none)' : fragment.warnings.map((w) => `  ${w}`).join('\n')
       // The offline path never needs the engine-form conversion, because a project
       // document already stores blocks in the wire form the compiler emits.
       if (args.dryRun === true) {
@@ -1405,9 +1735,18 @@ export function apply (ctx, rowConfig = {}) {
           `dry run: ${Object.keys(fragment.blocks).length} block(s) compiled into ${engine.blocks.length} engine block(s), ` +
           `${fragment.variables.length} variable declaration(s).`,
           `checks passed: every shadow is a primitive or the dropdown its input takes; every mutation carries the fields the editor reads` +
-          (procedures === undefined ? '' : `; ${procedures.length} custom block(s) of the target were available to resolve calls`),
+          (procedures === undefined ? '' : `; ${procedures.length} custom block(s) of the target were available to resolve calls`) +
+          (neededExtensions.length === 0
+            ? ''
+            : (extensionDialect.length > 0
+                ? `; ${neededExtensions.join(', ')} is loaded here, so its blocks were checked against the editor's own definitions`
+                : `; NOT checked for ${neededExtensions.join(', ')}: ${offline === null ? 'not loaded in this editor' : 'no editor, so a file is written as named'}`)),
           `warnings:\n${warnings}`
         ]
+        if (neededExtensions.length > 0) {
+          notes.push(`extensions this script needs: ${neededExtensions.join(', ')}` +
+            (offline === null ? '' : ' (the document will declare them when applied)'))
+        }
         // With a file in hand the result can be checked the way the editor will read it:
         // apply the fragment to a COPY and run the load check over the copy.
         if (offline !== null) {
@@ -1417,9 +1756,10 @@ export function apply (ctx, rowConfig = {}) {
             fragment,
             mode,
             script: args.script === undefined ? undefined : (typeof args.script === 'number' ? args.script : String(args.script)),
-            scope: args.scope === 'local' ? 'local' : 'global'
+            scope: args.scope === 'local' ? 'local' : 'global',
+            extensions: neededExtensions
           })
-          const report = verifyProject(copy, { assets: offline.assets })
+          const report = verifyProject(copy, { assets: offline.assets, knownExtensions: extensionDialect.map((extension) => extension.id) })
           notes.push('', formatReport(report, { heading: `load check of ${applied.target} after applying (nothing was written)` }))
         } else {
           notes.push('')
@@ -1442,7 +1782,11 @@ export function apply (ctx, rowConfig = {}) {
           fragment,
           mode,
           script: args.script === undefined ? undefined : (typeof args.script === 'number' ? args.script : String(args.script)),
-          scope: args.scope === 'local' ? 'local' : 'global'
+          scope: args.scope === 'local' ? 'local' : 'global',
+          // A file cannot load an extension, so the only honest thing to do with an
+          // extension block is write it as named AND declare the extension in the
+          // document, which is what every other Scratch tool reads.
+          extensions: neededExtensions
         })
         // The destination extension decides the format: writing an archive into a
         // file called project.json would produce a ZIP a reader cannot parse.
@@ -1454,7 +1798,7 @@ export function apply (ctx, rowConfig = {}) {
         // The written file is checked before it is announced as done. A splice can only
         // break things the fragment itself brought (dangling references, missing
         // assets), and saying so now is cheaper than finding out at load time.
-        const report = verifyProject(project, { assets })
+        const report = verifyProject(project, { assets, knownExtensions: neededExtensions })
         return {
           text: [
             `edited ${absolute}${destination === absolute ? ' in place' : ` -> ${destination}`} (${asJson ? 'project.json' : 'sb3 archive'})`,
@@ -1462,6 +1806,9 @@ export function apply (ctx, rowConfig = {}) {
             `now ${result.blocksAfter} block(s) in that target`,
             result.declaredVariables.length > 0 ? `declared variables: ${result.declaredVariables.join(', ')}` : 'no new variables',
             `comments: +${result.createdComments} / -${result.removedComments}`,
+            ...(result.extensionsAdded.length > 0
+              ? [`declared extension(s): ${result.extensionsAdded.join(', ')} — the editor loads them from the block opcodes when it opens this project`]
+              : []),
             `wrote ${bytes.length} bytes`,
             ...(containerWarnings.length > 0 ? [`container notes:\n${containerWarnings.map((w) => `  ${w}`).join('\n')}`] : []),
             ...(report.errors.length > 0 || report.warnings.length > 0
@@ -1488,7 +1835,10 @@ export function apply (ctx, rowConfig = {}) {
             applied.createdVariables.length > 0 ? `created variables: ${applied.createdVariables.join(', ')}` : 'no new variables',
             applied.createdComments > 0 || applied.removedComments > 0
               ? `comments: +${applied.createdComments} / -${applied.removedComments}`
-              : 'no comments changed'
+              : 'no comments changed',
+            ...(neededExtensions.length > 0
+              ? [`extension blocks written: ${neededExtensions.join(', ')} (that extension is loaded in this editor)`]
+              : [])
           ].join('\n')
         }
       })

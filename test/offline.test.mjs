@@ -248,3 +248,75 @@ test('a bare project.json is accepted as well as an .sb3', async () => {
     assert.equal(Object.keys(edited.targets.find((t) => t.name === 'Player').blocks).length, 2)
   })
 })
+
+/**
+ * Extension blocks, with no editor anywhere near.
+ *
+ * A `.sb3` that uses an extension is an ordinary file: the block's opcode carries the
+ * extension id, and the editor loads the extension from that prefix when it opens the
+ * project. What the offline path must do is (a) write the block as named, and (b) record
+ * the extension in the document, because that list is what every other Scratch tool
+ * reads. What it must NOT do is refuse the script for a shape it cannot check — the
+ * dialect lives in a running editor, and there is not one.
+ */
+test('extension blocks are written as named, and the document declares the extension', async () => {
+  await withTempWorkspace(async (workspace) => {
+    const call = harness(workspace)
+    const { project, assets } = fixtureProject()
+    await writeFile(join(workspace, 'game.sb3'), writeSb3(project, assets))
+
+    const applied = await call('gandi_apply', {
+      path: 'game.sb3',
+      target: 'Player',
+      xml: `<xml>
+        <block type="event_whenflagclicked" id="hat" x="0" y="0">
+          <next>
+            <block type="music_playDrumForBeats" id="drum">
+              <value name="DRUM"><shadow type="music_menu_DRUM"><field name="DRUM">3</field></shadow></value>
+              <value name="BEATS"><shadow type="math_number"><field name="NUM">0.5</field></shadow></value>
+            </block>
+          </next>
+        </block>
+      </xml>`
+    })
+    assert.match(applied.text, /applied 3 block\(s\) to Player/)
+    assert.match(applied.text, /declared extension\(s\): music/)
+    // The load check knows the prefix is an extension id, so it must not report it as an
+    // invented opcode — the block itself is fine, only its shape is unverifiable here.
+    assert.doesNotMatch(applied.text, /does not declare and the editor was not seen to offer/)
+
+    const reopened = readSb3(await readFile(join(workspace, 'game.sb3')))
+    assert.deepEqual(reopened.project.extensions, ['music'])
+    const player = reopened.project.targets.find((target) => target.name === 'Player')
+    assert.equal(player.blocks.drum.opcode, 'music_playDrumForBeats')
+    // The dropdown is a real shadow block, referenced by id — never inlined.
+    const menuId = player.blocks.drum.inputs.DRUM[1]
+    assert.equal(player.blocks[menuId].opcode, 'music_menu_DRUM')
+    assert.equal(player.blocks[menuId].shadow, true)
+    assert.deepEqual(player.blocks[menuId].fields.DRUM, ['3'])
+
+    // A dry run says out loud that the shape was not checked, instead of implying it was.
+    const dry = await call('gandi_apply', {
+      path: 'game.sb3',
+      target: 'Player',
+      dryRun: true,
+      xml: '<xml><block type="music_getTempo" id="tempo" x="0" y="0"/></xml>'
+    })
+    assert.match(dry.text, /NOT checked for music/)
+  })
+})
+
+test('gandi_extension says what is missing instead of reporting an empty catalogue', async () => {
+  await withTempWorkspace(async (workspace) => {
+    const call = harness(workspace)
+    await assert.rejects(
+      () => call('gandi_extension', { action: 'list' }),
+      (error) => {
+        assert.match(error.message, /no editor answered on port/)
+        assert.match(error.message, /gandi_launch/)
+        return true
+      }
+    )
+    await assert.rejects(() => call('gandi_extension', { action: 'load' }), /id must be a non-empty string/)
+  })
+})

@@ -80,7 +80,7 @@ export const randomBlockId = () => {
  *
  * @type {ReadonlyMap<string, {opcode: string, input: string}[]>}
  */
-const MENU_HOMES = (() => {
+const CORE_MENU_HOMES = (() => {
   const homes = new Map()
   for (const [opcode, inputs] of Object.entries(MENU_SHADOWS)) {
     for (const input of Object.keys(inputs)) {
@@ -94,12 +94,82 @@ const MENU_HOMES = (() => {
 })()
 
 /**
+ * The block dialect one compilation works against: the editor's own tables, plus
+ * whatever extensions the caller knows are loaded.
+ *
+ * An extension block's opcode, inputs and dropdown shadows exist only in a running
+ * editor — `runtime._blockInfo`, read by `bridge/extensions.mjs` — so they cannot live
+ * in the generated table. Passing them in per call is what lets the same compiler judge
+ * `<block type="music_playDrumForBeats">` while still refusing a typo in a core block.
+ *
+ * @typedef {object} Dialect
+ * @property {Map<string, {value: string[], statement: string[], menus: Record<string, string>, fields: string[]}>} blocks extension opcode -> its shape
+ * @property {Set<string>} menuShadows extension dropdown shadow opcodes
+ * @property {Map<string, string>} menuFields extension shadow opcode -> the field it carries
+ * @property {Map<string, {opcode: string, input: string}[]>} menuHomes extension shadow opcode -> where it belongs
+ * @property {string[]} ids the extension ids this dialect covers
+ */
+
+/** An empty dialect: compilation against the core blocks alone. */
+const EMPTY_DIALECT = Object.freeze({
+  blocks: new Map(),
+  menuShadows: new Set(),
+  menuFields: new Map(),
+  menuHomes: new Map(),
+  ids: Object.freeze([])
+})
+
+/**
+ * Merge the generated tables with the extensions a caller says are loaded.
+ *
+ * @param {any} dialect the `dialect` compile option, or undefined
+ * @returns {Dialect} a dialect usable for every lookup below
+ */
+const resolveDialect = (dialect) => {
+  if (dialect === undefined || dialect === null) return EMPTY_DIALECT
+  const list = Array.isArray(dialect) ? dialect : [dialect]
+  const blocks = new Map()
+  const menuShadows = new Set()
+  const menuFields = new Map()
+  const menuHomes = new Map()
+  const ids = []
+  for (const extension of list) {
+    if (extension === null || extension === undefined || typeof extension.id !== 'string') continue
+    ids.push(extension.id)
+    for (const block of extension.blocks ?? []) {
+      if (typeof block?.opcode !== 'string') continue
+      blocks.set(block.opcode, {
+        value: Array.isArray(block.valueInputs) ? block.valueInputs : [],
+        statement: Array.isArray(block.statementInputs) ? block.statementInputs : [],
+        menus: block.menuInputs ?? {},
+        fields: Array.isArray(block.fields) ? block.fields : []
+      })
+      for (const [input, shadow] of Object.entries(block.menuInputs ?? {})) {
+        if (typeof shadow !== 'string') continue
+        menuShadows.add(shadow)
+        const homes = menuHomes.get(shadow) ?? []
+        homes.push({ opcode: block.opcode, input })
+        menuHomes.set(shadow, homes)
+      }
+    }
+    for (const menu of extension.menus ?? []) {
+      if (typeof menu?.shadow !== 'string' || menu.shadow.length === 0) continue
+      menuShadows.add(menu.shadow)
+      if (typeof menu.field === 'string' && menu.field.length > 0) menuFields.set(menu.shadow, menu.field)
+    }
+  }
+  return { blocks, menuShadows, menuFields, menuHomes, ids }
+}
+
+/**
  * Readable list of the block.input places a dropdown shadow belongs under.
  * @param {string} shadowOpcode the menu's opcode
+ * @param {Dialect} [dialect] the extensions in play
  * @returns {string} e.g. `control_create_clone_of.CLONE_OPTION`
  */
-const menuHomes = (shadowOpcode) =>
-  (MENU_HOMES.get(shadowOpcode) ?? []).map((home) => `${home.opcode}.${home.input}`).join(' or ')
+const menuHomes = (shadowOpcode, dialect = EMPTY_DIALECT) =>
+  [...(CORE_MENU_HOMES.get(shadowOpcode) ?? []), ...(dialect.menuHomes.get(shadowOpcode) ?? [])]
+    .map((home) => `${home.opcode}.${home.input}`).join(' or ')
 
 /**
  * Validate one input's shadow against the block's OWN definition, and report what the
@@ -117,18 +187,24 @@ const menuHomes = (shadowOpcode) =>
  *     the runtime does not recognise is treated as an extension id: the editor fails
  *     with "Extension not found: broadcast" and the project stops opening.
  *
- * Only blocks the generated table knows are judged. An extension block's inputs are its
- * own business, and rejecting them would break working projects.
+ * Only blocks the generated table knows are judged, plus the extension blocks the
+ * caller passed in as loaded. An extension block nobody has loaded is left alone: its
+ * shape is not knowable offline, and rejecting it would break working projects.
  *
- * @param {{parentOpcode: string, parentId: string, inputName: string, isStatement: boolean, shadow?: any, errors: string[], warnings: string[]}} request the input to check
+ * @param {{parentOpcode: string, parentId: string, inputName: string, isStatement: boolean, shadow?: any, errors: string[], warnings: string[], dialect?: Dialect}} request the input to check
  */
 const checkInputShape = (request) => {
   const { parentOpcode, parentId, inputName, isStatement, shadow, errors, warnings } = request
-  if (!CORE_OPCODES.has(parentOpcode)) return
+  const dialect = request.dialect ?? EMPTY_DIALECT
+  const extension = dialect.blocks.get(parentOpcode)
 
-  const valueInputs = BLOCK_VALUE_INPUTS[parentOpcode] ?? []
-  const statementInputs = BLOCK_STATEMENT_INPUTS[parentOpcode] ?? []
-  const expected = MENU_SHADOWS[parentOpcode]?.[inputName]
+  if (extension === undefined && !CORE_OPCODES.has(parentOpcode)) return
+
+  const valueInputs = extension === undefined ? (BLOCK_VALUE_INPUTS[parentOpcode] ?? []) : extension.value
+  const statementInputs = extension === undefined ? (BLOCK_STATEMENT_INPUTS[parentOpcode] ?? []) : extension.statement
+  const expected = extension === undefined
+    ? MENU_SHADOWS[parentOpcode]?.[inputName]
+    : (extension.menus[inputName] === undefined ? undefined : [extension.menus[inputName], null])
 
   if (!valueInputs.includes(inputName) && !statementInputs.includes(inputName)) {
     warnings.push(`block ${parentId} (${parentOpcode}) has no input named "${inputName}"; it would be written to the project and never read`)
@@ -151,19 +227,30 @@ const checkInputShape = (request) => {
       // something else in this very dialect.
       const hint = shadowOpcode === 'broadcast_msg'
         ? ' `broadcast_msg` is the type of a broadcast VARIABLE in <variables>, not a shadow type.'
-        : (MENU_OPCODES.has(shadowOpcode) ? ` ${shadowOpcode} belongs under ${menuHomes(shadowOpcode)}.` : '')
+        : (MENU_OPCODES.has(shadowOpcode) || dialect.menuShadows.has(shadowOpcode) ? ` ${shadowOpcode} belongs under ${menuHomes(shadowOpcode, dialect)}.` : '')
       errors.push(`block ${parentId} (${parentOpcode}): input ${inputName} takes the dropdown <shadow type="${wantOpcode}">, not type="${shadowOpcode}".${hint}`)
       return
     }
+    // An extension's menu declares its field; the generated table carries the field
+    // name for core menus. When neither knows it, the field cannot be judged — but a
+    // shadow that carries NO field is still worth saying out loud, because a dropdown
+    // with no value reads as its first option or as nothing at all.
+    const knownField = wantField ?? dialect.menuFields.get(wantOpcode) ?? null
     const fieldNames = childElements(shadow, 'field')
       .map((field) => field.attributes.name)
       .filter((name) => typeof name === 'string' && name.length > 0)
-    if (!fieldNames.includes(wantField)) {
-      errors.push(`block ${parentId} (${parentOpcode}): the ${wantOpcode} shadow needs <field name="${wantField}">; it has ` +
+    if (knownField === null) {
+      if (fieldNames.length === 0) {
+        warnings.push(`block ${parentId} (${parentOpcode}): the ${wantOpcode} shadow carries no <field>, so the dropdown has no value selected`)
+      }
+      return
+    }
+    if (!fieldNames.includes(knownField)) {
+      errors.push(`block ${parentId} (${parentOpcode}): the ${wantOpcode} shadow needs <field name="${knownField}">; it has ` +
         (fieldNames.length === 0 ? 'no fields at all' : fieldNames.map((name) => `"${name}"`).join(', ')))
     }
     for (const name of fieldNames) {
-      if (name !== wantField) {
+      if (name !== knownField) {
         warnings.push(`block ${parentId} (${parentOpcode}): the ${wantOpcode} shadow carries <field name="${name}">, which nothing reads`)
       }
     }
@@ -171,9 +258,9 @@ const checkInputShape = (request) => {
   }
 
   if (isPrimitiveOpcode(shadowOpcode)) return
-  if (MENU_OPCODES.has(shadowOpcode)) {
+  if (MENU_OPCODES.has(shadowOpcode) || dialect.menuShadows.has(shadowOpcode)) {
     errors.push(`block ${parentId} (${parentOpcode}): input ${inputName} does not take a dropdown, but its shadow is the menu ${shadowOpcode}` +
-      (menuHomes(shadowOpcode) === '' ? '' : `, which belongs under ${menuHomes(shadowOpcode)}`))
+      (menuHomes(shadowOpcode, dialect) === '' ? '' : `, which belongs under ${menuHomes(shadowOpcode, dialect)}`))
     return
   }
   errors.push(`block ${parentId} (${parentOpcode}): <shadow type="${shadowOpcode}"> under ${inputName} is neither a primitive ` +
@@ -230,12 +317,16 @@ const normalizeMutation = (opcode, attributes, errors) => {
  * Compile a scratch-blocks XML fragment into sb3 blocks.
  *
  * @param {string} source XML text: an `<xml>` root, or a bare `<block>`/`<shadow>`
- * @param {{newId?: () => string, procedures?: Iterable<{proccode: string, argumentids?: any, argumentnames?: any, warp?: any}>}} [options] injectable id generator (tests use a counter) and the custom blocks the target already has
+ * @param {{newId?: () => string, procedures?: Iterable<{proccode: string, argumentids?: any, argumentnames?: any, warp?: any}>, dialect?: any}} [options] injectable id generator (tests use a counter), the custom blocks the target already has, and the extensions known to be loaded
  * @returns {CompiledFragment} the compiled fragment
  * @throws {ScriptCompileError} when the document is not a usable script fragment, or when the XML would produce a project the editor cannot open
  */
 export function compileScripts (source, options = {}) {
   const newId = options.newId ?? randomBlockId
+  // Extensions the caller knows are loaded in the target editor. Their blocks are not
+  // in the generated table — an opcode only exists once the extension is loaded — so
+  // they arrive per call and are merged into every lookup below.
+  const dialect = resolveDialect(options.dialect)
 
   const root = parseXml(source)
   const scripts = []
@@ -422,9 +513,9 @@ export function compileScripts (source, options = {}) {
       }
       // A field the block does not have is written to the archive and read by nobody, so
       // a misspelled dropdown name (`CURRENT_OPTION` for `CURRENTMENU`) is a silent
-      // no-op. Only blocks the generated table describes are judged; an extension
-      // block's fields are its own business.
-      const knownFields = BLOCK_FIELDS[opcode]
+      // no-op. Only blocks the dialect describes are judged; an extension block nobody
+      // has loaded is left alone, because its fields are not knowable from here.
+      const knownFields = BLOCK_FIELDS[opcode] ?? dialect.blocks.get(opcode)?.fields
       if (knownFields !== undefined && !knownFields.includes(name)) {
         warnings.push(`block ${id} (${opcode}) has no field named "${name}"; its fields are ` +
           (knownFields.length === 0 ? '(none)' : knownFields.map((field) => `"${field}"`).join(', ')) +
@@ -464,7 +555,8 @@ export function compileScripts (source, options = {}) {
         isStatement: input.name === 'statement',
         shadow: childElements(input, 'shadow')[0],
         errors,
-        warnings
+        warnings,
+        dialect
       })
       const compiled = compileInput(input, id, warnings, newId, compileBlock)
       if (compiled !== null) block.inputs[name] = compiled
@@ -501,7 +593,7 @@ export function compileScripts (source, options = {}) {
     comments.push({ ...record, id, blockId: null })
   }
 
-  const fragment = { blocks, topLevelIds, variables, comments, warnings }
+  const fragment = { blocks, topLevelIds, variables, comments, warnings, dialectIds: dialect.ids }
   resolveProcedures(fragment, warnings, errors, newId, options.procedures)
   placeComments(fragment)
 
@@ -1099,3 +1191,50 @@ export function decompileScripts (fragment, options = {}) {
   emit(0, '</xml>')
   return lines.join('\n')
 }
+
+// ── which extensions a fragment or a document uses ──────────────────────────
+
+/**
+ * The extension ids a set of blocks depends on, read off their opcode prefixes.
+ *
+ * This is how a fragment says "load `music` first": the prefix before the first
+ * underscore of a non-core opcode IS the extension id, which is exactly the rule the
+ * editor's own deserializer uses (`sb3.js` calls `opcode.split('_')[0]`). Nothing here
+ * decides whether that extension exists — the editor is the only authority on that, and
+ * `bridge/extensions.mjs` asks it.
+ *
+ * @param {Record<string, any>} blocks block id -> block, in either wire shape
+ * @returns {string[]} extension ids, in first-seen order
+ */
+export const extensionsOfBlocks = (blocks) => {
+  const ids = []
+  for (const block of Object.values(blocks ?? {})) {
+    if (Array.isArray(block)) continue
+    const opcode = block?.opcode
+    if (typeof opcode !== 'string' || opcode.length === 0) continue
+    const prefix = opcode.split('_')[0]
+    if (CORE_OPCODES.has(opcode) || CORE_PREFIXES.has(prefix)) continue
+    if (!ids.includes(prefix)) ids.push(prefix)
+  }
+  return ids
+}
+
+/**
+ * The extension ids a compiled fragment needs.
+ * @param {{blocks?: Record<string, any>}} fragment a compiled fragment
+ * @returns {string[]} extension ids, in first-seen order
+ */
+export const extensionsOfFragment = (fragment) => extensionsOfBlocks(fragment?.blocks)
+
+/**
+ * Opcode prefixes that belong to Scratch itself.
+ *
+ * Kept beside the compiler because both use it for the same reason: the prefix before
+ * the first underscore is what decides whether an opcode is an extension block, and
+ * `text` is a category Gandi added to the core (the text extension is a core prefix in
+ * this editor even though `text_*` blocks behave like extension blocks elsewhere).
+ */
+const CORE_PREFIXES = new Set([
+  'motion', 'looks', 'sound', 'event', 'control', 'sensing', 'operator',
+  'data', 'procedures', 'argument', 'math', 'colour', 'text'
+])

@@ -25,32 +25,41 @@ const sourceFiles = (directory) => {
   return found
 }
 
-test('no page-source template literal contains a backtick in a comment', () => {
+test('no page-source template literal contains a backtick', () => {
   const offenders = []
 
   // tools/ too: the probe and cleanup scripts embed page source the same way, and
   // a violation there is just as hard to read as one in src/. (This happened three
   // times while building the plugin, which is why the guard covers both.)
+  //
+  // EVERY backtick inside a template is reported, not just one on a comment line. The
+  // first version of this guard only looked at comments, and an extension probe then
+  // put one inside a REGEX LITERAL in page source — invisible to the guard, and the
+  // only symptom was "Unexpected identifier" naming an unrelated word twenty lines
+  // away. The rule is absolute here: page source contains no nested template literals
+  // and no escaped backticks, so none of them is ever legitimate inside a body.
+  //
+  // The bodies come from the same scanner the syntax check uses, so this reports what
+  // the page would actually receive — including a backtick that a doc comment in the
+  // page source would otherwise smuggle in. ESCAPED backticks count too: `\`` in the
+  // outer module becomes a literal backtick in the page source, where it closes
+  // whatever template the page is inside. That was a real delivery (`gandi_costume`'s
+  // "pass exactly one of \`svg\` or \`base64\`"), and it is the same class of bug the
+  // syntax check catches — caught here at the line that caused it instead of by
+  // "Unexpected identifier" somewhere else.
   for (const directory of ['src', 'tools']) {
     for (const file of sourceFiles(join(root, directory))) {
-      const lines = readFileSync(file, 'utf8').split('\n')
-      let insideTemplate = false
-      for (let index = 0; index < lines.length; index++) {
-        const line = lines[index]
-        const ticks = (line.match(/`/g) ?? []).length
-        const hadOddTicks = ticks % 2 === 1
-        // Toggling on odd counts is exact for this codebase: it uses no nested
-        // template literals and no escaped backticks inside page source.
-        if (hadOddTicks) insideTemplate = !insideTemplate
-        if (!insideTemplate && !hadOddTicks) continue
-        if (insideTemplate && line.includes('`') && line.includes('//')) {
-          offenders.push(`${relative(root, file)}:${index + 1}: ${line.trim()}`)
-        }
+      for (const body of templateBodies(readFileSync(file, 'utf8'), file)) {
+        if (!body.text.includes('`')) continue
+        // Only the escaped form `${'`'}`-free bodies are interesting; a body that
+        // contains a backtick is a body the page cannot parse, at any line.
+        const line = body.line + body.text.slice(0, body.text.indexOf('`')).split('\n').length - 1
+        offenders.push(`${relative(root, file)}:${line}: ${body.text.split('\n')[body.text.slice(0, body.text.indexOf('`')).split('\n').length - 1].trim()}`)
       }
     }
   }
 
-  assert.deepEqual(offenders, [], `backtick inside a comment in a page-source template:\n${offenders.join('\n')}`)
+  assert.deepEqual(offenders, [], `backtick inside a page-source template:\n${offenders.join('\n')}`)
 })
 
 test('every plugin source file is importable', async () => {

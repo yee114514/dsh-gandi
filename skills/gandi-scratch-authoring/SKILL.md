@@ -98,6 +98,64 @@ gandi_status → (gandi_launch) → gandi_inspect → gandi_apply → gandi_run 
 
 不确定某个块的输入名或 shadow 时：`gandi_inspect` 读一个已经用了该块的脚本，
 或者 `dryRun` 一次让它告诉你。**不要猜——猜错的两种结果分别是"静默无效"和"项目打不开"。**
+唯一例外是**扩展积木**（下一节）：那套 shadow 名字编辑器会直接印给你。
+
+### 扩展积木（音乐、画笔、3D…）：先载入，再写
+
+扩展就是「添加扩展」里那些类别。**它的积木在载入之前根本不存在**（连 opcode 都不存在），
+所以顺序是固定的两步：
+
+```
+gandi_extension {action: "list"}                 # ① 这台编辑器提供哪些 id、已经载入了哪些
+gandi_extension {action: "load", id: "music"}    # ② 载入一个，并把它的方言打出来
+```
+
+②的输出就是照着写积木的全部依据（每个积木一行，最后是菜单表）：
+
+```
+music (音乐) — 9 block(s)
+  <block type="music_playDrumForBeats">
+    inputs: DRUM (dropdown <shadow type="music_menu_DRUM"><field name="DRUM">), BEATS
+  <block type="music_restForBeats">
+    inputs: BEATS
+  menus:
+    <shadow type="music_menu_DRUM"><field name="DRUM"> — e.g. "(1) 小军鼓" (18 options)
+```
+
+于是这个块长这样：
+
+```xml
+<block type="music_playDrumForBeats">
+  <value name="DRUM"><shadow type="music_menu_DRUM"><field name="DRUM">3</field></shadow></value>
+  <value name="BEATS"><shadow type="math_number"><field name="NUM">0.5</field></shadow></value>
+</block>
+```
+
+要点：
+
+- **opcode 带扩展 id 前缀**（`music_restForBeats`、`pen_penDown`）——前缀就是"编辑器要载入哪个扩展"。
+- **下拉的字段名不一定等于输入名**：`music_menu_DRUM` 的字段是 `DRUM`，
+  但 `pen_menu_colorParam` 的字段是 `colorParam`。**抄输出里的 `menus:` 那一段**，别按输入名猜。
+- **下拉的值**也要用菜单表里给的真实选项（`e.g. "…"`）。写一个不存在的选项**不会报错**，
+  运行时只是读到空值或第一个值——又一个静默失效。
+- **扩展的循环/条件积木**，内部脚本同样用 `<statement name="SUBSTACK">`（输出的 `statement inputs:` 会写明）。
+- **id 的大小写和点号都是 id 的一部分**（`witCat.dollyPro`、`sipc.ink.Recording`、`YUEN.feishu`），照抄。
+- 载入后**不用**自己往工程里写 `extensions` 数组：编辑器保存时自己会写；离线改文件时会替你写。
+- 没载入就写它的积木 → `gandi_apply` **拒绝**，并告诉你该载入哪一个（不会写出
+  "跑起来什么都没有"的积木）。
+- 只改文件、没有编辑器时：扩展积木按名字写进文件，扩展记进文档，编辑器打开时自己载入。
+  这种情况下形状没法校验，`dryRun` 会明确说 `NOT checked`。
+- **一个工程可以同时用多个扩展**，逐个 `load` 就行；想看已有工程用了哪些，`gandi_inspect` 会打印
+  （文件里有 `extensions:` 一行，编辑器里有 `extensions loaded:` 一行）。
+- 只有 Gandi 有的扩展（`CCW3D`、`GandiAIHub`、`box2d`…）要用 `list` 查 id，
+  这台机器上编辑器一共提供 93 个；别照 Scratch 官网的名单猜。整个库实测都能载入
+  （89 个未禁用里 88 个；`whiteBoard` 是编辑器自己载不动）。
+- **能写 ≠ 有用**：硬件类（`wedo2`、`microbit`、`ev3`、`makeymakey`、`boost`、`gdxfor`、
+  `tello`、`redBoard`）要插着那个设备，在线服务类（`GandiAIHub`、`cocreaFetch`、`sipc.ink.*`…）
+  要账号或网络。别承诺一个没插硬件的无人机游戏。
+- **注意"设备类"扩展**：`list` 输出里带 `[uses a device]` 的那些（`GandiKamera`、`faceSensing`、
+  视频侦测…）**一载入就会打开用户的摄像头/麦克风**——不需要用它的积木。载入结果里会说明开了什么、
+  并且插件已经把它关掉。没事别去载入它们。
 
 ## 常用 opcode / 输入名速查
 
@@ -429,6 +487,41 @@ gandi_merge   {from:'a.sb3', path:'main.sb3'}            # 合并另一个写手
 - 离线只管脚本和变量声明；**画造型、建变量、跑起来看**都需要编辑器。
 - 想做完整循环（改一下、跑一下、看一眼）就先 `gandi_launch`。
 
+### `gandi_launch` 不会关掉用户已经开着的 Gandi
+
+这是刻意的，别绕过去：
+
+- **已经在跑、并且带调试端口的那个 Gandi 会被直接接管**（连它已经开的编辑器页签一起用），
+  不会开第二个窗口。
+- **在跑但没带调试端口的那个连不上**（Chromium 的调试服务只在进程启动时创建，
+  运行期补不了）。这时 `gandi_launch` **报错并给出出路**，它不会替你关掉那个窗口：
+  - `gandi_launch {launcher: true}`：在开始菜单放一个带端口的 `Gandi (DSH attachable)`，
+    以后用户从它打开 Gandi，就能被接管；
+  - `gandi_launch {restart: true}`：真的重启那个窗口。**先问用户**——
+    没保存的东西在那个窗口里。
+- **不要自己 taskkill Gandi**，也不要在旁边再拉一个：前者可能带走用户没保存的作品，
+  后者会让用户看到两个窗口、而你在改另一个。
+
+`gandi_status` 会告诉你现在的处境，看这几行：
+`Gandi process:` / `attachable endpoint:` / `editor on screen:`。
+
+### 用户看不看得见你在做什么
+
+Gandi 的窗口里同一时刻只显示一个视图：项目浏览器（主页）是一个，每个作品是一个。
+**插件打开的编辑器视图一定在最前面**，所以你改的东西正常情况下就在用户眼前。
+
+- `gandi_status` 的 `editor on screen:` 是权威答案：
+  `on-screen`（正看着呢）/ `behind-gandi-views`（窗口在屏幕上，但显示的是主页或别的作品）/
+  `window-behind`（窗口被别的窗口挡住了——插件**绝不抢焦点**，这时你什么都别做，
+  等用户切回来）。
+- 用户点了主页之后，**下一次真正改东西之前插件会自己把编辑器切回最前**，
+  不重新加载、不丢状态。这一步发生时，那次工具结果末尾会有一行 NOTE。
+- 别为了"让用户看见"去调任何窗口相关的花招（置顶、抢焦点、关视图）：
+  实测 `Target.closeTarget` 关视图会把整个 Gandi 弄死；`Page.bringToFront` 只会抢用户焦点、
+  还不切换窗口内部的视图。
+- 反过来也别假设用户看得到：如果你在 `gandi_run` 里发现状态诡异，而 status 说
+  `window-behind`，那多半只是用户在看别的窗口。
+
 ## Gandi 与 Scratch 的差别（会踩到的几条）
 
 - **打开编辑器**：Gandi 启动后停在"我的作品"列表页，编辑器是单独一个页面。
@@ -437,4 +530,7 @@ gandi_merge   {from:'a.sb3', path:'main.sb3'}            # 合并另一个写手
 - **`gandi_new` 是新建一个本地项目**：舞台 + 一个起始角色，不占用户账号的作品位。
 - **新建角色**是"复制一个已有角色 → 清空 → 换造型"，所以项目里至少要有一个角色可复制——
   这就是 `gandi_new` 自带起始角色的原因。
-- **云变量、Gandi 插件/扩展积木**都没做，别承诺。
+- **云变量没做**，别承诺。
+- **扩展积木能用，但要先 `gandi_extension {action:"load"}`**（见《扩展积木》一节）。
+  载入是编辑器自己的动作，所以它会出现在工具箱里，用户也能拖——这一点和"插件偷偷塞东西"不同。
+- **Gandi 的"插件"体系（插件设置里填 URL 加载 JS）没做**，也不是这个工具该走的路。
